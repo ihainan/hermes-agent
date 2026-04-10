@@ -833,31 +833,53 @@ async def _send_homeassistant(token, extra, chat_id, message):
 
 
 async def _send_dingtalk(extra, chat_id, message):
-    """Send via DingTalk robot webhook.
+    """Send via DingTalk proactive robot API.
 
-    Note: The gateway's DingTalk adapter uses per-session webhook URLs from
-    incoming messages (dingtalk-stream SDK).  For cross-platform send_message
-    delivery we use a static robot webhook URL instead, which must be
-    configured via ``DINGTALK_WEBHOOK_URL`` env var or ``webhook_url`` in the
-    platform's extra config.
+    Supports targeted group and DM sends without requiring a live gateway adapter.
+    Routing: chat_id starting with 'cid' → group (groupMessages/send);
+    otherwise → DM (oToMessages/batchSend, chat_id used as userId).
     """
     try:
         import httpx
     except ImportError:
         return {"error": "httpx not installed"}
+
+    client_id = extra.get("client_id") or os.getenv("DINGTALK_CLIENT_ID", "")
+    client_secret = extra.get("client_secret") or os.getenv("DINGTALK_CLIENT_SECRET", "")
+    if not client_id or not client_secret:
+        return {"error": "DingTalk not configured. Set DINGTALK_CLIENT_ID and DINGTALK_CLIENT_SECRET."}
+
+    _API_BASE = "https://api.dingtalk.com/v1.0"
+    is_group = chat_id.startswith("cid")
+    msg_param = json.dumps({"title": "Hermes", "text": message[:3800]})
+    payload = {
+        "robotCode": client_id,
+        "msgKey": "sampleMarkdown",
+        "msgParam": msg_param,
+    }
+    if is_group:
+        payload["openConversationId"] = chat_id
+        endpoint = f"{_API_BASE}/robot/groupMessages/send"
+    else:
+        payload["userIds"] = [chat_id]
+        endpoint = f"{_API_BASE}/robot/oToMessages/batchSend"
+
     try:
-        webhook_url = extra.get("webhook_url") or os.getenv("DINGTALK_WEBHOOK_URL", "")
-        if not webhook_url:
-            return {"error": "DingTalk not configured. Set DINGTALK_WEBHOOK_URL env var or webhook_url in dingtalk platform extra config."}
         async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                webhook_url,
-                json={"msgtype": "text", "text": {"content": message}},
+            token_resp = await client.post(
+                f"{_API_BASE}/oauth2/accessToken",
+                json={"appKey": client_id, "appSecret": client_secret},
+                timeout=10.0,
             )
-            resp.raise_for_status()
+            token_resp.raise_for_status()
+            token = token_resp.json()["accessToken"]
+            headers = {"x-acs-dingtalk-access-token": token, "Content-Type": "application/json"}
+            resp = await client.post(endpoint, json=payload, headers=headers)
+            if resp.status_code >= 300:
+                return _error(f"DingTalk API error HTTP {resp.status_code}: {resp.text[:200]}")
             data = resp.json()
-            if data.get("errcode", 0) != 0:
-                return _error(f"DingTalk API error: {data.get('errmsg', 'unknown')}")
+            if data.get("errcode", 0) not in (0, None, ""):
+                return _error(f"DingTalk error: {data.get('errmsg', 'unknown')}")
         return {"success": True, "platform": "dingtalk", "chat_id": chat_id}
     except Exception as e:
         return _error(f"DingTalk send failed: {e}")
