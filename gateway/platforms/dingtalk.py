@@ -188,13 +188,12 @@ class DingTalkAdapter(BasePlatformAdapter):
                 # Rebuild fresh client on each attempt — clears any stale internal state.
                 credential = dingtalk_stream.Credential(self._client_id, self._client_secret)
                 self._stream_client = dingtalk_stream.DingTalkStreamClient(credential)
-                loop = asyncio.get_running_loop()
-                handler = _IncomingHandler(self, loop)
+                handler = _IncomingHandler(self, None)
                 self._stream_client.register_callback_handler(
                     dingtalk_stream.ChatbotMessage.TOPIC, handler
                 )
 
-                await asyncio.to_thread(self._stream_client.start)
+                await self._stream_client.start()
                 # Clean exit from SDK — reset failure counter and backoff.
                 self._consecutive_failures = 0
                 backoff_idx = 0
@@ -302,12 +301,17 @@ class DingTalkAdapter(BasePlatformAdapter):
         reply_to_text, reply_to_message_id = self._extract_quoted_context(message)
         if reply_to_text:
             # Extract the original sender from repliedMsg (not the current sender)
-            raw_text = getattr(message, "text", None) or {}
-            if isinstance(raw_text, dict):
-                replied = raw_text.get("repliedMsg") or {}
-                quoted_sender = replied.get("msgSenderNick", "") if isinstance(replied, dict) else ""
+            raw_text = getattr(message, "text", None)
+            # Normalise to dict (SDK may return TextContent object)
+            if hasattr(raw_text, "extensions"):
+                raw_dict = {"content": getattr(raw_text, "content", "") or ""}
+                raw_dict.update(raw_text.extensions or {})
+            elif isinstance(raw_text, dict):
+                raw_dict = raw_text
             else:
-                quoted_sender = ""
+                raw_dict = {}
+            replied = raw_dict.get("repliedMsg") or {}
+            quoted_sender = replied.get("msgSenderNick", "") if isinstance(replied, dict) else ""
             prefix = f'[Replying to {quoted_sender}: "{reply_to_text}"]\n' if quoted_sender else f'[Replying to: "{reply_to_text}"]\n'
             text = prefix + text
 
@@ -381,7 +385,8 @@ class DingTalkAdapter(BasePlatformAdapter):
         Downloads media via _download_media() and caches locally.
         On download failure falls back to text-only (never drops the message).
         """
-        msgtype = getattr(message, "msgtype", None) or "text"
+        msgtype = getattr(message, "message_type", None) or getattr(message, "msgtype", None) or "text"
+        # SDK stores media content in type-specific fields; use content as a fallback dict
         content = getattr(message, "content", None) or {}
         if not isinstance(content, dict):
             content = {}
@@ -390,7 +395,11 @@ class DingTalkAdapter(BasePlatformAdapter):
         media_types: list = []
 
         if msgtype == "picture":
-            download_code = content.get("downloadCode", "")
+            image_content = getattr(message, "image_content", None)
+            download_code = (
+                getattr(image_content, "download_code", None)
+                or content.get("downloadCode", "")
+            )
             if download_code:
                 path, mime = await self._download_media(download_code, "image/jpeg", ".jpg")
                 if path:
@@ -430,7 +439,13 @@ class DingTalkAdapter(BasePlatformAdapter):
             return file_name, MessageType.DOCUMENT, media_urls, media_types
 
         if msgtype == "richText":
-            rich_parts = content.get("richText", []) or []
+            # SDK stores richText in rich_text_content.rich_text_list
+            rich_text_content = getattr(message, "rich_text_content", None)
+            rich_parts = []
+            if rich_text_content and hasattr(rich_text_content, "rich_text_list"):
+                rich_parts = rich_text_content.rich_text_list or []
+            elif isinstance(content.get("richText"), list):
+                rich_parts = content["richText"]
             text_parts = []
             for part in rich_parts:
                 if not isinstance(part, dict):
@@ -536,12 +551,23 @@ class DingTalkAdapter(BasePlatformAdapter):
     def _extract_text(message: "ChatbotMessage") -> str:
         """Extract plain text from a DingTalk chatbot message."""
         text = getattr(message, "text", None) or ""
-        if isinstance(text, dict):
+        if hasattr(text, "content"):
+            # SDK returns a TextContent object when msgtype == "text"
+            content = (text.content or "").strip()
+        elif isinstance(text, dict):
             content = text.get("content", "").strip()
         else:
             content = str(text).strip()
 
-        # Fall back to rich text if present
+        # Fall back to rich_text_content (SDK object) or legacy rich_text list
+        if not content:
+            rich_text_content = getattr(message, "rich_text_content", None)
+            if rich_text_content and hasattr(rich_text_content, "rich_text"):
+                parts = [
+                    item.get("text", "") for item in (rich_text_content.rich_text or [])
+                    if isinstance(item, dict) and item.get("text")
+                ]
+                content = " ".join(parts).strip()
         if not content:
             rich_text = getattr(message, "rich_text", None)
             if rich_text and isinstance(rich_text, list):
@@ -556,14 +582,27 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         Returns (reply_to_text, reply_to_message_id). Both are None if the
         message is not a reply or if quoted fields are absent/malformed.
+
+        The SDK parses msgtype=text into a TextContent object; extra fields
+        such as isReplyMsg and repliedMsg land in TextContent.extensions.
+        We also handle the legacy dict format for test compatibility.
         """
-        raw_text = getattr(message, "text", None) or {}
-        if not isinstance(raw_text, dict):
-            return None, None
-        if not raw_text.get("isReplyMsg"):
+        raw_text = getattr(message, "text", None)
+
+        # Normalise to a plain dict for unified processing
+        if hasattr(raw_text, "extensions"):
+            # SDK TextContent object: merge content + extensions into one dict
+            raw_dict: dict = {"content": raw_text.content or ""}
+            raw_dict.update(raw_text.extensions or {})
+        elif isinstance(raw_text, dict):
+            raw_dict = raw_text
+        else:
             return None, None
 
-        replied = raw_text.get("repliedMsg")
+        if not raw_dict.get("isReplyMsg"):
+            return None, None
+
+        replied = raw_dict.get("repliedMsg")
         if not replied or not isinstance(replied, dict):
             return None, None
 
@@ -1124,7 +1163,12 @@ class DingTalkAdapter(BasePlatformAdapter):
 # ---------------------------------------------------------------------------
 
 class _IncomingHandler(ChatbotHandler if DINGTALK_STREAM_AVAILABLE else object):
-    """dingtalk-stream ChatbotHandler that forwards messages to the adapter."""
+    """dingtalk-stream ChatbotHandler that forwards messages to the adapter.
+
+    The SDK calls process() as an async coroutine, passing a CallbackMessage.
+    The actual chatbot payload lives in callback_message.data (a JSON string
+    or dict) which we parse into a ChatbotMessage and hand to the adapter.
+    """
 
     def __init__(self, adapter: DingTalkAdapter, loop: asyncio.AbstractEventLoop):
         if DINGTALK_STREAM_AVAILABLE:
@@ -1132,19 +1176,15 @@ class _IncomingHandler(ChatbotHandler if DINGTALK_STREAM_AVAILABLE else object):
         self._adapter = adapter
         self._loop = loop
 
-    def process(self, message: "ChatbotMessage"):
-        """Called by dingtalk-stream in its thread when a message arrives.
-
-        Schedules the async handler on the main event loop.
-        """
-        loop = self._loop
-        if loop is None or loop.is_closed():
-            logger.error("[DingTalk] Event loop unavailable, cannot dispatch message")
-            return dingtalk_stream.AckMessage.STATUS_OK, "OK"
-
-        future = asyncio.run_coroutine_threadsafe(self._adapter._on_message(message), loop)
+    async def process(self, callback_message: "Any") -> "tuple":
+        """Called by dingtalk-stream when a chatbot message arrives."""
         try:
-            future.result(timeout=60)
+            data = getattr(callback_message, "data", {})
+            if isinstance(data, str):
+                import json as _json
+                data = _json.loads(data)
+            message = dingtalk_stream.ChatbotMessage.from_dict(data)
+            await self._adapter._on_message(message)
         except Exception:
             logger.exception("[DingTalk] Error processing incoming message")
 

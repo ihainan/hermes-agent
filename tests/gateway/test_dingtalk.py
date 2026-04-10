@@ -730,15 +730,16 @@ class TestHealthCheckAndReconnection:
 
         call_count = 0
 
-        async def fake_to_thread(fn):
+        async def fake_start():
             nonlocal call_count
             call_count += 1
             adapter._running = False  # stop loop after first call
 
-        with patch("gateway.platforms.dingtalk.dingtalk_stream") as mock_dt, \
-             patch("asyncio.to_thread", side_effect=fake_to_thread):
+        with patch("gateway.platforms.dingtalk.dingtalk_stream") as mock_dt:
             mock_dt.Credential.return_value = MagicMock()
-            mock_dt.DingTalkStreamClient.return_value = MagicMock()
+            mock_client = MagicMock()
+            mock_client.start = fake_start
+            mock_dt.DingTalkStreamClient.return_value = mock_client
             mock_dt.ChatbotMessage.TOPIC = "chatbot"
             await adapter._run_stream()
 
@@ -752,12 +753,16 @@ class TestHealthCheckAndReconnection:
         adapter = self._make_adapter()
         adapter._running = True
 
+        async def failing_start():
+            raise RuntimeError("boom")
+
         with patch("gateway.platforms.dingtalk.dingtalk_stream") as mock_dt, \
-             patch("asyncio.to_thread", side_effect=RuntimeError("boom")), \
              patch("asyncio.sleep", new_callable=AsyncMock), \
              patch.object(adapter, "_set_fatal_error") as mock_fatal:
             mock_dt.Credential.return_value = MagicMock()
-            mock_dt.DingTalkStreamClient.return_value = MagicMock()
+            mock_client = MagicMock()
+            mock_client.start = failing_start
+            mock_dt.DingTalkStreamClient.return_value = mock_client
             mock_dt.ChatbotMessage.TOPIC = "chatbot"
             await adapter._run_stream()
 
@@ -774,7 +779,6 @@ class TestHealthCheckAndReconnection:
         adapter = self._make_adapter()
         adapter._running = True
         call_count = 0
-
         sleep_delays = []
 
         async def fake_sleep(n):
@@ -784,18 +788,20 @@ class TestHealthCheckAndReconnection:
             if call_count >= 1:
                 adapter._running = False
 
+        async def failing_start():
+            raise RuntimeError("err")
+
         with patch("gateway.platforms.dingtalk.dingtalk_stream") as mock_dt, \
-             patch("asyncio.to_thread", side_effect=RuntimeError("err")), \
              patch("asyncio.sleep", side_effect=fake_sleep), \
              patch("gateway.platforms.dingtalk.random.random", return_value=0.8):
             mock_dt.Credential.return_value = MagicMock()
-            mock_dt.DingTalkStreamClient.return_value = MagicMock()
+            mock_client = MagicMock()
+            mock_client.start = failing_start
+            mock_dt.DingTalkStreamClient.return_value = mock_client
             mock_dt.ChatbotMessage.TOPIC = "chatbot"
             await adapter._run_stream()
 
         assert len(sleep_delays) >= 1
-        # With random=0.8: jitter = base * 0.2 * (2*0.8-1) = base * 0.2 * 0.6 = base * 0.12
-        # Delay must differ from plain base — not exactly 2.0
         assert sleep_delays[0] != 2.0
 
     @pytest.mark.asyncio
@@ -807,7 +813,7 @@ class TestHealthCheckAndReconnection:
         adapter._running = True
         attempt = 0
 
-        async def fake_to_thread(fn):
+        async def start_side_effect():
             nonlocal attempt
             attempt += 1
             if attempt >= 2:
@@ -816,10 +822,11 @@ class TestHealthCheckAndReconnection:
                 raise RuntimeError("first fail")
 
         with patch("gateway.platforms.dingtalk.dingtalk_stream") as mock_dt, \
-             patch("asyncio.to_thread", side_effect=fake_to_thread), \
              patch("asyncio.sleep", new_callable=AsyncMock):
             mock_dt.Credential.return_value = MagicMock()
-            mock_dt.DingTalkStreamClient.return_value = MagicMock()
+            mock_client = MagicMock()
+            mock_client.start = start_side_effect
+            mock_dt.DingTalkStreamClient.return_value = mock_client
             mock_dt.ChatbotMessage.TOPIC = "chatbot"
             await adapter._run_stream()
 
@@ -1047,10 +1054,13 @@ class TestParseInboundMessage:
 
     def _make_msg(self, msgtype="text", content=None, text=None):
         msg = MagicMock()
-        msg.msgtype = msgtype
+        msg.message_type = msgtype   # SDK field name (from_dict sets message_type)
+        msg.msgtype = msgtype        # keep for backward compat with any fallback path
         msg.content = content or {}
         msg.text = text or {}
         msg.rich_text = None
+        msg.image_content = None
+        msg.rich_text_content = None
         return msg
 
     def _ok_download_resp(self, download_url="https://cdn.example/file"):
@@ -1090,7 +1100,11 @@ class TestParseInboundMessage:
         adapter._http_client.post = AsyncMock(return_value=self._ok_download_resp())
         adapter._http_client.get = AsyncMock(return_value=self._ok_file_resp(b"\xff\xd8\xff", "image/jpeg"))
 
-        msg = self._make_msg("picture", content={"downloadCode": "code-img-1"})
+        msg = self._make_msg("picture")
+        # Simulate SDK ImageContent object
+        image_content = MagicMock()
+        image_content.download_code = "code-img-1"
+        msg.image_content = image_content
 
         with patch("gateway.platforms.dingtalk.cache_image_from_bytes", return_value="/cache/img.jpg") as mock_cache:
             text, msg_type, media_urls, media_types = await adapter._parse_inbound_message(msg)
@@ -1113,10 +1127,12 @@ class TestParseInboundMessage:
         err_resp.text = "error"
         adapter._http_client.post = AsyncMock(return_value=err_resp)
 
-        msg = self._make_msg("picture", content={"downloadCode": "code-img-fail"})
+        msg = self._make_msg("picture")
+        image_content = MagicMock()
+        image_content.download_code = "code-img-fail"
+        msg.image_content = image_content
         text, msg_type, media_urls, media_types = await adapter._parse_inbound_message(msg)
 
-        # Still returns PHOTO type, but no media cached
         assert msg_type.value == "photo"
         assert media_urls == []
         mod._TOKEN_CACHE.pop("bot-id", None)
@@ -1193,12 +1209,14 @@ class TestParseInboundMessage:
     @pytest.mark.asyncio
     async def test_rich_text_concatenates_text_parts(self):
         adapter = self._make_adapter()
-        msg = self._make_msg("richText", content={
-            "richText": [
-                {"type": "text", "text": "Hello "},
-                {"type": "text", "text": "world"},
-            ]
-        })
+        msg = self._make_msg("richText")
+        # Simulate SDK RichTextContent object with rich_text_list
+        rich_text_content = MagicMock()
+        rich_text_content.rich_text_list = [
+            {"type": "text", "text": "Hello "},
+            {"type": "text", "text": "world"},
+        ]
+        msg.rich_text_content = rich_text_content
         text, msg_type, media_urls, _ = await adapter._parse_inbound_message(msg)
         assert text == "Hello world"
         assert msg_type.value == "text"
@@ -1214,12 +1232,13 @@ class TestParseInboundMessage:
         adapter._http_client.post = AsyncMock(return_value=self._ok_download_resp())
         adapter._http_client.get = AsyncMock(return_value=self._ok_file_resp(b"img", "image/jpeg"))
 
-        msg = self._make_msg("richText", content={
-            "richText": [
-                {"type": "text", "text": "See this: "},
-                {"type": "picture", "downloadCode": "code-inline-img"},
-            ]
-        })
+        msg = self._make_msg("richText")
+        rich_text_content = MagicMock()
+        rich_text_content.rich_text_list = [
+            {"type": "text", "text": "See this: "},
+            {"type": "picture", "downloadCode": "code-inline-img"},
+        ]
+        msg.rich_text_content = rich_text_content
 
         with patch("gateway.platforms.dingtalk.cache_image_from_bytes", return_value="/cache/inline.jpg"):
             text, msg_type, media_urls, _ = await adapter._parse_inbound_message(msg)
