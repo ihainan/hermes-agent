@@ -294,3 +294,101 @@ class TestHomeChannelEnvOverrides:
             home = config.platforms[platform].home_channel
             assert home is not None, f"{platform.value}: home_channel should not be None"
             assert (home.chat_id, home.name) == expected, platform.value
+
+
+# ---------------------------------------------------------------------------
+# DingTalk env override (Issue #10)
+# ---------------------------------------------------------------------------
+
+
+class TestApplyEnvOverridesDingTalk:
+
+    def test_enables_dingtalk_when_both_vars_set(self):
+        config = GatewayConfig()
+        env = {
+            "DINGTALK_CLIENT_ID": "app-key-123",
+            "DINGTALK_CLIENT_SECRET": "app-secret-456",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            _apply_env_overrides(config)
+
+        assert Platform.DINGTALK in config.platforms
+        pc = config.platforms[Platform.DINGTALK]
+        assert pc.enabled is True
+        assert pc.extra["client_id"] == "app-key-123"
+        assert pc.extra["client_secret"] == "app-secret-456"
+
+    def test_does_not_enable_when_only_client_id_set(self):
+        config = GatewayConfig()
+        env = {"DINGTALK_CLIENT_ID": "app-key-123"}
+        with patch.dict(os.environ, env, clear=True):
+            _apply_env_overrides(config)
+
+        assert Platform.DINGTALK not in config.platforms
+
+    def test_does_not_enable_when_only_client_secret_set(self):
+        config = GatewayConfig()
+        env = {"DINGTALK_CLIENT_SECRET": "app-secret-456"}
+        with patch.dict(os.environ, env, clear=True):
+            _apply_env_overrides(config)
+
+        assert Platform.DINGTALK not in config.platforms
+
+    def test_does_not_overwrite_existing_config(self):
+        existing = PlatformConfig(
+            enabled=True,
+            extra={"client_id": "existing-id", "client_secret": "existing-secret"},
+        )
+        config = GatewayConfig(platforms={Platform.DINGTALK: existing})
+        env = {
+            "DINGTALK_CLIENT_ID": "new-id",
+            "DINGTALK_CLIENT_SECRET": "new-secret",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            _apply_env_overrides(config)
+
+        # update() merges, so env vars win; verify the platform is still enabled
+        pc = config.platforms[Platform.DINGTALK]
+        assert pc.enabled is True
+        assert pc.extra["client_id"] == "new-id"
+
+    def test_loads_home_channel_when_set(self):
+        config = GatewayConfig()
+        env = {
+            "DINGTALK_CLIENT_ID": "id",
+            "DINGTALK_CLIENT_SECRET": "secret",
+            "DINGTALK_HOME_CHANNEL": "cidABC123",
+            "DINGTALK_HOME_CHANNEL_NAME": "Engineering",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            _apply_env_overrides(config)
+
+        home = config.platforms[Platform.DINGTALK].home_channel
+        assert home is not None
+        assert home.chat_id == "cidABC123"
+        assert home.name == "Engineering"
+        assert home.platform == Platform.DINGTALK
+
+    def test_home_channel_defaults_name_to_home(self):
+        config = GatewayConfig()
+        env = {
+            "DINGTALK_CLIENT_ID": "id",
+            "DINGTALK_CLIENT_SECRET": "secret",
+            "DINGTALK_HOME_CHANNEL": "cidXYZ",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            _apply_env_overrides(config)
+
+        home = config.platforms[Platform.DINGTALK].home_channel
+        assert home.name == "Home"
+
+    def test_no_home_channel_when_not_set(self):
+        config = GatewayConfig()
+        env = {
+            "DINGTALK_CLIENT_ID": "id",
+            "DINGTALK_CLIENT_SECRET": "secret",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            _apply_env_overrides(config)
+
+        assert config.platforms[Platform.DINGTALK].home_channel is None
