@@ -2091,3 +2091,315 @@ class TestPlatformEnum:
 
     def test_dingtalk_in_platform_enum(self):
         assert Platform.DINGTALK.value == "dingtalk"
+
+
+# ---------------------------------------------------------------------------
+# Emoji Reaction Acknowledgment (Issue #6)
+# ---------------------------------------------------------------------------
+
+
+class TestReactionHelpers:
+    """Unit tests for _add_reaction() and _remove_reaction()."""
+
+    def _make_adapter(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(
+            PlatformConfig(enabled=True, extra={"client_id": "bot-id", "client_secret": "secret"})
+        )
+        adapter._http_client = AsyncMock()
+        return adapter
+
+    def _token(self):
+        import time
+        import gateway.platforms.dingtalk as mod
+        mod._TOKEN_CACHE["bot-id"] = ("tok", time.time() + 3600)
+
+    def _clear_token(self):
+        import gateway.platforms.dingtalk as mod
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_add_reaction_posts_to_emotion_reply(self):
+        self._token()
+        adapter = self._make_adapter()
+        ok = MagicMock()
+        ok.status_code = 200
+        adapter._http_client.post = AsyncMock(return_value=ok)
+
+        await adapter._add_reaction("msg-1", "cid-chat", "⏳")
+
+        call_url = adapter._http_client.post.call_args[0][0]
+        assert "robot/emotion/reply" in call_url
+        body = adapter._http_client.post.call_args[1]["json"]
+        assert body["msgId"] == "msg-1"
+        assert body["conversationId"] == "cid-chat"
+        assert body["emojiType"] == "⏳"
+        self._clear_token()
+
+    @pytest.mark.asyncio
+    async def test_add_reaction_is_noop_without_http_client(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._http_client = None
+        # Must not raise
+        await adapter._add_reaction("msg-1", "cid-chat", "⏳")
+
+    @pytest.mark.asyncio
+    async def test_add_reaction_ignores_api_error(self):
+        self._token()
+        adapter = self._make_adapter()
+        adapter._http_client.post = AsyncMock(side_effect=Exception("network error"))
+        # Must not raise
+        await adapter._add_reaction("msg-1", "cid-chat", "⏳")
+        self._clear_token()
+
+    @pytest.mark.asyncio
+    async def test_remove_reaction_sends_delete_to_emotion_recall(self):
+        self._token()
+        adapter = self._make_adapter()
+        ok = MagicMock()
+        ok.status_code = 200
+        adapter._http_client.request = AsyncMock(return_value=ok)
+
+        await adapter._remove_reaction("msg-1", "cid-chat", "⏳")
+
+        call_method = adapter._http_client.request.call_args[0][0]
+        call_url = adapter._http_client.request.call_args[0][1]
+        assert call_method == "DELETE"
+        assert "robot/emotion/recall" in call_url
+        body = adapter._http_client.request.call_args[1]["json"]
+        assert body["msgId"] == "msg-1"
+        assert body["emojiType"] == "⏳"
+        self._clear_token()
+
+    @pytest.mark.asyncio
+    async def test_remove_reaction_is_noop_without_http_client(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._http_client = None
+        await adapter._remove_reaction("msg-1", "cid-chat", "⏳")
+
+    @pytest.mark.asyncio
+    async def test_remove_reaction_ignores_api_error(self):
+        self._token()
+        adapter = self._make_adapter()
+        adapter._http_client.request = AsyncMock(side_effect=Exception("network error"))
+        await adapter._remove_reaction("msg-1", "cid-chat", "⏳")
+        self._clear_token()
+
+
+class TestFinalizeReaction:
+    """Unit tests for _finalize_reaction()."""
+
+    def _make_adapter(self, ack="emoji"):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(
+            PlatformConfig(enabled=True, extra={"client_id": "bot-id", "client_secret": "secret",
+                                                "ack_reaction": ack})
+        )
+        adapter._http_client = AsyncMock()
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_swaps_to_success_emoji_on_success(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter, SendResult
+        adapter = self._make_adapter()
+        adapter._pending_reactions["msg-1"] = ("cid-chat", "⏳")
+
+        with patch.object(adapter, "_remove_reaction", new_callable=AsyncMock) as mock_rm, \
+             patch.object(adapter, "_add_reaction", new_callable=AsyncMock) as mock_add:
+            await adapter._finalize_reaction("msg-1", SendResult(success=True))
+
+        mock_rm.assert_awaited_once_with("msg-1", "cid-chat", "⏳")
+        mock_add.assert_awaited_once_with("msg-1", "cid-chat", adapter._ACK_SUCCESS)
+        assert "msg-1" not in adapter._pending_reactions
+
+    @pytest.mark.asyncio
+    async def test_swaps_to_error_emoji_on_failure(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter, SendResult
+        adapter = self._make_adapter()
+        adapter._pending_reactions["msg-1"] = ("cid-chat", "⏳")
+
+        with patch.object(adapter, "_remove_reaction", new_callable=AsyncMock) as mock_rm, \
+             patch.object(adapter, "_add_reaction", new_callable=AsyncMock) as mock_add:
+            await adapter._finalize_reaction("msg-1", SendResult(success=False, error="oops"))
+
+        mock_rm.assert_awaited_once_with("msg-1", "cid-chat", "⏳")
+        mock_add.assert_awaited_once_with("msg-1", "cid-chat", adapter._ACK_ERROR)
+
+    @pytest.mark.asyncio
+    async def test_noop_when_msg_id_not_tracked(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter, SendResult
+        adapter = self._make_adapter()
+
+        with patch.object(adapter, "_remove_reaction", new_callable=AsyncMock) as mock_rm, \
+             patch.object(adapter, "_add_reaction", new_callable=AsyncMock) as mock_add:
+            await adapter._finalize_reaction("unknown-msg", SendResult(success=True))
+
+        mock_rm.assert_not_awaited()
+        mock_add.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_noop_when_msg_id_is_none(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter, SendResult
+        adapter = self._make_adapter()
+
+        with patch.object(adapter, "_remove_reaction", new_callable=AsyncMock) as mock_rm, \
+             patch.object(adapter, "_add_reaction", new_callable=AsyncMock) as mock_add:
+            await adapter._finalize_reaction(None, SendResult(success=True))
+
+        mock_rm.assert_not_awaited()
+        mock_add.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_noop_when_reactions_disabled(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter, SendResult
+        adapter = self._make_adapter(ack="none")
+        adapter._pending_reactions["msg-1"] = ("cid-chat", "⏳")
+
+        with patch.object(adapter, "_remove_reaction", new_callable=AsyncMock) as mock_rm, \
+             patch.object(adapter, "_add_reaction", new_callable=AsyncMock) as mock_add:
+            await adapter._finalize_reaction("msg-1", SendResult(success=True))
+
+        mock_rm.assert_not_awaited()
+        mock_add.assert_not_awaited()
+        # pending entry should NOT have been consumed (reactions disabled, never added)
+        assert "msg-1" in adapter._pending_reactions
+
+
+class TestReactionAckConfig:
+    """Tests for the ack_reaction config option."""
+
+    def test_reactions_enabled_by_default(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        assert adapter._ack_reaction_enabled is True
+
+    def test_reactions_disabled_via_config(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(
+            PlatformConfig(enabled=True, extra={"ack_reaction": "none"})
+        )
+        assert adapter._ack_reaction_enabled is False
+
+    def test_reactions_enabled_explicitly(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(
+            PlatformConfig(enabled=True, extra={"ack_reaction": "emoji"})
+        )
+        assert adapter._ack_reaction_enabled is True
+
+    def test_reactions_disabled_case_insensitive(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(
+            PlatformConfig(enabled=True, extra={"ack_reaction": "  None  "})
+        )
+        assert adapter._ack_reaction_enabled is False
+
+
+class TestReactionIntegration:
+    """Integration tests: _on_message adds reaction; send() finalizes it."""
+
+    def _make_msg(self, msg_id="msg-int-1", text="hello"):
+        msg = MagicMock()
+        msg.message_id = msg_id
+        msg.text = {"content": text}
+        msg.rich_text = None
+        msg.conversation_id = "cidGROUP1"
+        msg.conversation_type = "1"
+        msg.sender_id = "uid-1"
+        msg.sender_nick = "Alice"
+        msg.sender_staff_id = ""
+        msg.conversation_title = "Test"
+        msg.session_webhook = "https://wh.example/hook"
+        msg.create_at = None
+        msg.msgtype = "text"
+        msg.content = {}
+        return msg
+
+    def _make_adapter(self, ack="emoji"):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(
+            PlatformConfig(enabled=True, extra={"client_id": "bot-id", "client_secret": "secret",
+                                                "ack_reaction": ack})
+        )
+        adapter._http_client = AsyncMock()
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_on_message_adds_pending_reaction(self):
+        adapter = self._make_adapter()
+        adapter.set_message_handler(AsyncMock())
+
+        with patch.object(adapter, "_add_reaction", new_callable=AsyncMock) as mock_add:
+            await adapter._on_message(self._make_msg("msg-int-1"))
+
+        mock_add.assert_awaited_once_with("msg-int-1", "cidGROUP1", adapter._ACK_PENDING)
+        assert "msg-int-1" in adapter._pending_reactions
+
+    @pytest.mark.asyncio
+    async def test_on_message_skips_reaction_when_disabled(self):
+        adapter = self._make_adapter(ack="none")
+        adapter.set_message_handler(AsyncMock())
+
+        with patch.object(adapter, "_add_reaction", new_callable=AsyncMock) as mock_add:
+            await adapter._on_message(self._make_msg("msg-int-2"))
+
+        mock_add.assert_not_awaited()
+        assert "msg-int-2" not in adapter._pending_reactions
+
+    @pytest.mark.asyncio
+    async def test_send_finalizes_reaction_on_success(self):
+        import time, gateway.platforms.dingtalk as mod
+        mod._TOKEN_CACHE["bot-id"] = ("tok", time.time() + 3600)
+
+        adapter = self._make_adapter()
+        adapter._pending_reactions["msg-int-3"] = ("cidGROUP1", "⏳")
+        ok = MagicMock()
+        ok.status_code = 200
+        ok.text = ""
+        adapter._http_client.post = AsyncMock(return_value=ok)
+
+        with patch.object(adapter, "_finalize_reaction", new_callable=AsyncMock) as mock_fin:
+            await adapter.send("cidGROUP1", "response",
+                               reply_to="msg-int-3",
+                               metadata={"session_webhook": "https://wh.example/hook"})
+
+        mock_fin.assert_awaited_once()
+        call_args = mock_fin.call_args[0]
+        assert call_args[0] == "msg-int-3"
+        assert call_args[1].success is True
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_send_finalizes_reaction_on_failure(self):
+        import time, gateway.platforms.dingtalk as mod
+        mod._TOKEN_CACHE["bot-id"] = ("tok", time.time() + 3600)
+
+        adapter = self._make_adapter()
+        adapter._pending_reactions["msg-int-4"] = ("cidGROUP1", "⏳")
+        err = MagicMock()
+        err.status_code = 500
+        err.text = "Server Error"
+        adapter._http_client.post = AsyncMock(return_value=err)
+
+        with patch.object(adapter, "_finalize_reaction", new_callable=AsyncMock) as mock_fin:
+            await adapter.send("cidGROUP1", "response",
+                               reply_to="msg-int-4",
+                               metadata={"session_webhook": "https://wh.example/hook"})
+
+        mock_fin.assert_awaited_once()
+        call_args = mock_fin.call_args[0]
+        assert call_args[1].success is False
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_disconnect_clears_pending_reactions(self):
+        adapter = self._make_adapter()
+        adapter._pending_reactions["msg-x"] = ("cid-x", "⏳")
+        adapter._stream_task = None
+        adapter._health_check_task = None
+
+        await adapter.disconnect()
+
+        assert len(adapter._pending_reactions) == 0

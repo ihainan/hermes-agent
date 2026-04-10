@@ -126,6 +126,16 @@ class DingTalkAdapter(BasePlatformAdapter):
         self._chat_types: Dict[str, str] = {}      # chat_id → "group" | "dm"
         self._dm_user_ids: Dict[str, str] = {}     # DM chat_id → sender_id
 
+        # Emoji reaction acknowledgment (issue #6)
+        # Disable with config.extra.ack_reaction = "none"
+        ack_cfg = (extra.get("ack_reaction") or "emoji").strip().lower()
+        self._ack_reaction_enabled: bool = ack_cfg != "none"
+        self._ACK_PENDING = "⏳"    # added on message receipt
+        self._ACK_SUCCESS = "✅"    # swapped in after successful send
+        self._ACK_ERROR   = "❌"    # swapped in after failed send
+        # Track in-flight reactions: msg_id → (chat_id, pending_emoji)
+        self._pending_reactions: Dict[str, tuple] = {}
+
     # -- Connection lifecycle -----------------------------------------------
 
     async def connect(self) -> bool:
@@ -249,6 +259,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         self._seen_messages.clear()
         self._chat_types.clear()
         self._dm_user_ids.clear()
+        self._pending_reactions.clear()
         logger.info("[%s] Disconnected", self.name)
 
     async def _health_check_loop(self) -> None:
@@ -353,6 +364,12 @@ class DingTalkAdapter(BasePlatformAdapter):
         logger.debug("[%s] Message from %s in %s (%s): %s",
                      self.name, sender_nick, chat_id[:20] if chat_id else "?",
                      message_type.value, text[:50])
+
+        # Acknowledge receipt with a reaction before the agent starts (issue #6)
+        if self._ack_reaction_enabled and chat_id:
+            await self._add_reaction(msg_id, chat_id, self._ACK_PENDING)
+            self._pending_reactions[msg_id] = (chat_id, self._ACK_PENDING)
+
         await self.handle_message(event)
 
     async def _parse_inbound_message(
@@ -655,6 +672,10 @@ class DingTalkAdapter(BasePlatformAdapter):
         Prefers session_webhook (immediate reply path). Falls back to the
         proactive robot API when no webhook is cached for the chat_id, enabling
         cron delivery and agent-initiated sends.
+
+        After sending, updates the emoji reaction on the triggering message
+        to ✅ (success) or ❌ (failure). reply_to carries the inbound msg_id
+        so the correct reaction can be found in _pending_reactions.
         """
         metadata = metadata or {}
 
@@ -670,19 +691,23 @@ class DingTalkAdapter(BasePlatformAdapter):
             try:
                 resp = await self._http_client.post(session_webhook, json=payload, timeout=15.0)
                 if resp.status_code < 300:
-                    return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
-                body = resp.text
-                logger.warning("[%s] Send failed HTTP %d: %s", self.name, resp.status_code, body[:200])
-                return SendResult(success=False, error=f"HTTP {resp.status_code}: {body[:200]}")
+                    result = SendResult(success=True, message_id=uuid.uuid4().hex[:12])
+                else:
+                    body = resp.text
+                    logger.warning("[%s] Send failed HTTP %d: %s", self.name, resp.status_code, body[:200])
+                    result = SendResult(success=False, error=f"HTTP {resp.status_code}: {body[:200]}")
             except httpx.TimeoutException:
-                return SendResult(success=False, error="Timeout sending message to DingTalk")
+                result = SendResult(success=False, error="Timeout sending message to DingTalk")
             except Exception as e:
                 logger.error("[%s] Send error: %s", self.name, e)
-                return SendResult(success=False, error=str(e))
+                result = SendResult(success=False, error=str(e))
+        else:
+            # No session_webhook — use proactive robot API
+            logger.debug("[%s] No session_webhook for %s, using proactive API", self.name, chat_id[:20])
+            result = await self._send_proactive(chat_id, content)
 
-        # No session_webhook — use proactive robot API
-        logger.debug("[%s] No session_webhook for %s, using proactive API", self.name, chat_id[:20])
-        return await self._send_proactive(chat_id, content)
+        await self._finalize_reaction(reply_to, result)
+        return result
 
     async def _send_proactive(self, chat_id: str, content: str) -> SendResult:
         """Send via DingTalk proactive robot API (no session_webhook needed).
@@ -1027,6 +1052,63 @@ class DingTalkAdapter(BasePlatformAdapter):
         except Exception:
             pass
         return 0
+
+    # -- Emoji reaction acknowledgment (issue #6) ---------------------------
+
+    async def _add_reaction(self, msg_id: str, chat_id: str, emoji: str) -> None:
+        """Add an emoji reaction to an inbound DingTalk message.
+
+        Calls POST /v1.0/robot/emotion/reply. Failures are logged as warnings
+        and never propagate — reactions are purely cosmetic feedback.
+        """
+        if not self._http_client:
+            return
+        try:
+            headers = await self._dingtalk_headers()
+            await self._http_client.post(
+                f"{_DINGTALK_API_BASE}/robot/emotion/reply",
+                json={"msgId": msg_id, "conversationId": chat_id, "emojiType": emoji},
+                headers=headers,
+                timeout=5.0,
+            )
+        except Exception as e:
+            logger.warning("[%s] _add_reaction failed (non-fatal): %s", self.name, e)
+
+    async def _remove_reaction(self, msg_id: str, chat_id: str, emoji: str) -> None:
+        """Remove an emoji reaction from an inbound DingTalk message.
+
+        Calls DELETE /v1.0/robot/emotion/recall. Failures are non-fatal.
+        """
+        if not self._http_client:
+            return
+        try:
+            headers = await self._dingtalk_headers()
+            await self._http_client.request(
+                "DELETE",
+                f"{_DINGTALK_API_BASE}/robot/emotion/recall",
+                json={"msgId": msg_id, "conversationId": chat_id, "emojiType": emoji},
+                headers=headers,
+                timeout=5.0,
+            )
+        except Exception as e:
+            logger.warning("[%s] _remove_reaction failed (non-fatal): %s", self.name, e)
+
+    async def _finalize_reaction(self, msg_id: Optional[str], result: SendResult) -> None:
+        """Swap the pending ⏳ reaction to ✅ or ❌ after a send completes.
+
+        Looks up the pending reaction by msg_id. If found, removes the pending
+        emoji and adds the outcome emoji. No-op when reactions are disabled or
+        msg_id is not tracked.
+        """
+        if not self._ack_reaction_enabled or not msg_id:
+            return
+        pending = self._pending_reactions.pop(msg_id, None)
+        if not pending:
+            return
+        chat_id, pending_emoji = pending
+        await self._remove_reaction(msg_id, chat_id, pending_emoji)
+        outcome_emoji = self._ACK_SUCCESS if result.success else self._ACK_ERROR
+        await self._add_reaction(msg_id, chat_id, outcome_emoji)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """DingTalk does not support typing indicators."""
