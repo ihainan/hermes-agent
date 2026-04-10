@@ -285,3 +285,37 @@ class TestFormatDirectoryForDisplay:
         assert "Discord (Server1):" in result
         assert "Discord (Server2):" in result
         assert "discord:#general" in result
+
+
+class TestDingTalkSessionDiscovery:
+    """DingTalk must be in the session-based discovery list (issue #13)."""
+
+    def _write_sessions(self, tmp_path, sessions_data):
+        sessions_path = tmp_path / "sessions" / "sessions.json"
+        sessions_path.parent.mkdir(parents=True)
+        sessions_path.write_text(json.dumps(sessions_data))
+
+    def test_dingtalk_sessions_appear_via_build_from_sessions(self, tmp_path):
+        self._write_sessions(tmp_path, {
+            "s1": {
+                "origin": {
+                    "platform": "dingtalk",
+                    "chat_id": "cidGROUP1",
+                    "chat_name": "Engineering",
+                },
+                "chat_type": "group",
+            }
+        })
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            entries = _build_from_sessions("dingtalk")
+
+        ids = {e["id"] for e in entries}
+        assert "cidGROUP1" in ids
+
+    def test_dingtalk_in_session_based_platforms_list(self):
+        """Regression guard: 'dingtalk' must be in the hardcoded discovery tuple."""
+        import inspect
+        import gateway.channel_directory as mod
+        source = inspect.getsource(mod.build_channel_directory)
+        assert '"dingtalk"' in source or "'dingtalk'" in source
