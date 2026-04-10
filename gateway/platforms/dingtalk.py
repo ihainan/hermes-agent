@@ -42,6 +42,13 @@ except ImportError:
     HTTPX_AVAILABLE = False
     httpx = None  # type: ignore[assignment]
 
+try:
+    import mutagen
+    MUTAGEN_AVAILABLE = True
+except ImportError:
+    MUTAGEN_AVAILABLE = False
+    mutagen = None  # type: ignore[assignment]
+
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -742,6 +749,284 @@ class DingTalkAdapter(BasePlatformAdapter):
                 last_result = SendResult(success=False, error=str(e))
 
         return last_result
+
+    # -- Outbound media ---------------------------------------------------------
+
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send an image to a DingTalk chat.
+
+        Downloads the image from image_url, uploads to DingTalk, then sends
+        via sampleImageMsg template. Falls back to a text link on any failure.
+        """
+        if not self._http_client:
+            return SendResult(success=False, error="HTTP client not initialized")
+
+        # Download image bytes
+        try:
+            resp = await self._http_client.get(image_url, timeout=30.0, follow_redirects=True)
+            if resp.status_code >= 300:
+                raise RuntimeError(f"HTTP {resp.status_code}")
+            image_bytes = resp.content
+            content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+            ext = "." + content_type.split("/")[-1] if "/" in content_type else ".jpg"
+            if ext not in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
+                ext = ".jpg"
+            filename = f"image{ext}"
+        except Exception as e:
+            logger.warning("[%s] send_image: failed to download %s: %s", self.name, image_url[:80], e)
+            return await self.send(chat_id, f"[Image]({image_url})" + (f"\n{caption}" if caption else ""))
+
+        # Upload to DingTalk
+        media_id = await self._upload_media(image_bytes, "image", filename)
+        if not media_id:
+            return await self.send(chat_id, f"[Image]({image_url})" + (f"\n{caption}" if caption else ""))
+
+        # Send via sampleImageMsg — photoURL field requires a public URL; DingTalk
+        # recommends using the mediaId path. We pass the original URL instead since
+        # DingTalk's image template uses photoURL (a CDN URL), not mediaId.
+        # Use sampleMarkdown with an embedded image link as the most reliable path.
+        text = f"![]({image_url})"
+        if caption:
+            text = f"{text}\n{caption}"
+        return await self._send_media_proactive(chat_id, "sampleMarkdown",
+                                                 {"title": "Image", "text": text})
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send an audio/voice message to a DingTalk chat.
+
+        Uploads the file and sends via sampleAudio template.
+        Duration is parsed via mutagen when available; falls back to 0.
+        See issue #9 for tracking accurate duration without mutagen.
+        """
+        try:
+            with open(audio_path, "rb") as f:
+                audio_bytes = f.read()
+        except OSError as e:
+            return SendResult(success=False, error=f"Cannot read audio file: {e}")
+
+        filename = os.path.basename(audio_path) or "audio.amr"
+        media_id = await self._upload_media(audio_bytes, "voice", filename)
+        if not media_id:
+            return await self.send(chat_id, f"🔊 Audio: {audio_path}" + (f"\n{caption}" if caption else ""))
+
+        duration = self._get_audio_duration(audio_path)
+        return await self._send_media_proactive(
+            chat_id, "sampleAudio",
+            {"mediaId": media_id, "duration": str(duration)},
+        )
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a document/file to a DingTalk chat via sampleFile template."""
+        try:
+            with open(file_path, "rb") as f:
+                file_bytes = f.read()
+        except OSError as e:
+            return SendResult(success=False, error=f"Cannot read file: {e}")
+
+        filename = file_name or os.path.basename(file_path) or "document"
+        media_id = await self._upload_media(file_bytes, "file", filename)
+        if not media_id:
+            return await self.send(chat_id, f"📎 File: {file_path}" + (f"\n{caption}" if caption else ""))
+
+        file_type = os.path.splitext(filename)[1].lstrip(".") or "bin"
+        return await self._send_media_proactive(
+            chat_id, "sampleFile",
+            {"mediaId": media_id, "fileName": filename, "fileType": file_type},
+        )
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a video to a DingTalk chat via sampleVideo template."""
+        try:
+            with open(video_path, "rb") as f:
+                video_bytes = f.read()
+        except OSError as e:
+            return SendResult(success=False, error=f"Cannot read video file: {e}")
+
+        filename = os.path.basename(video_path) or "video.mp4"
+        media_id = await self._upload_media(video_bytes, "video", filename)
+        if not media_id:
+            return await self.send(chat_id, f"🎬 Video: {video_path}" + (f"\n{caption}" if caption else ""))
+
+        duration = self._get_audio_duration(video_path)
+        video_size = len(video_bytes)
+        return await self._send_media_proactive(
+            chat_id, "sampleVideo",
+            {
+                "mediaId": media_id,
+                "videoThumbnailURL": "",
+                "duration": str(duration),
+                "videoSize": str(video_size),
+            },
+        )
+
+    async def _upload_media(
+        self,
+        data: bytes,
+        media_type: str,
+        filename: str,
+    ) -> "Optional[str]":
+        """Upload media bytes to DingTalk and return the mediaId.
+
+        media_type must be one of: image, voice, video, file.
+        Returns None on failure (caller should fall back to text).
+        """
+        if not self._http_client:
+            return None
+        try:
+            headers = await self._dingtalk_headers()
+        except RuntimeError as e:
+            logger.warning("[%s] _upload_media: token error: %s", self.name, e)
+            return None
+
+        # Remove Content-Type from headers — we set it manually with the boundary
+        upload_headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
+
+        try:
+            body, boundary = self._build_multipart(data, media_type, filename)
+            upload_headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+            resp = await self._http_client.post(
+                f"{_DINGTALK_API_BASE}/robot/messageFiles/upload",
+                headers=upload_headers,
+                content=body,
+                timeout=30.0,
+            )
+            if resp.status_code >= 300:
+                logger.warning("[%s] Media upload failed HTTP %d: %s",
+                               self.name, resp.status_code, resp.text[:200])
+                return None
+            result = resp.json()
+            media_id = result.get("mediaId")
+            if not media_id:
+                logger.warning("[%s] No mediaId in upload response: %s", self.name, str(result)[:200])
+            return media_id
+        except Exception as e:
+            logger.warning("[%s] Media upload error: %s", self.name, e)
+            return None
+
+    def _build_multipart(self, data: bytes, media_type: str, filename: str) -> bytes:
+        """Build a multipart/form-data body for the DingTalk media upload API.
+
+        Fields: robotCode, mediaType, uploadedFileName, media (binary).
+        Returns raw bytes with a unique boundary; the caller must set the
+        Content-Type header to multipart/form-data; boundary=<boundary>.
+        We return (body_bytes, boundary) so the caller can set the header.
+        """
+        boundary = uuid.uuid4().hex
+
+        def field(name: str, value: str) -> bytes:
+            return (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{name}"\r\n'
+                f"\r\n"
+                f"{value}\r\n"
+            ).encode()
+
+        body = b""
+        body += field("robotCode", self._client_id)
+        body += field("mediaType", media_type)
+        body += field("uploadedFileName", filename)
+        body += (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="media"; filename="{filename}"\r\n'
+            f"Content-Type: application/octet-stream\r\n"
+            f"\r\n"
+        ).encode()
+        body += data
+        body += f"\r\n--{boundary}--\r\n".encode()
+        return body, boundary
+
+    async def _send_media_proactive(
+        self,
+        chat_id: str,
+        msg_key: str,
+        msg_param: Dict[str, Any],
+    ) -> SendResult:
+        """Send a media message via DingTalk proactive robot API.
+
+        Reuses the group/DM routing logic from _send_proactive().
+        """
+        if not self._http_client:
+            return SendResult(success=False, error="HTTP client not initialized")
+
+        chat_type = self._chat_types.get(chat_id)
+        if chat_type is None:
+            chat_type = "group" if chat_id.startswith("cid") else "dm"
+        is_group = chat_type == "group"
+        user_id = None if is_group else (self._dm_user_ids.get(chat_id) or chat_id)
+
+        try:
+            headers = await self._dingtalk_headers()
+        except RuntimeError as e:
+            return SendResult(success=False, error=f"Token error: {e}")
+
+        payload: Dict[str, Any] = {
+            "robotCode": self._client_id,
+            "msgKey": msg_key,
+            "msgParam": json.dumps(msg_param),
+        }
+        if is_group:
+            payload["openConversationId"] = chat_id
+            endpoint = f"{_DINGTALK_API_BASE}/robot/groupMessages/send"
+        else:
+            payload["userIds"] = [user_id]
+            endpoint = f"{_DINGTALK_API_BASE}/robot/oToMessages/batchSend"
+
+        try:
+            resp = await self._http_client.post(endpoint, json=payload, headers=headers, timeout=15.0)
+            if resp.status_code < 300:
+                return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
+            logger.warning("[%s] Media send failed HTTP %d: %s",
+                           self.name, resp.status_code, resp.text[:200])
+            return SendResult(success=False, error=f"HTTP {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            logger.error("[%s] Media send error: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
+    @staticmethod
+    def _get_audio_duration(path: str) -> int:
+        """Return audio/video duration in seconds using mutagen (soft dependency).
+
+        Returns 0 if mutagen is not installed or the file cannot be parsed.
+        See issue #9 for tracking accurate duration support.
+        """
+        if not MUTAGEN_AVAILABLE:
+            return 0
+        try:
+            audio = mutagen.File(path)  # type: ignore[union-attr]
+            if audio and hasattr(audio, "info") and hasattr(audio.info, "length"):
+                return max(1, int(audio.info.length))
+        except Exception:
+            pass
+        return 0
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """DingTalk does not support typing indicators."""

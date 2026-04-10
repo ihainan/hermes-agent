@@ -1256,6 +1256,837 @@ class TestParseInboundMessage:
         mod._TOKEN_CACHE.pop("bot-id", None)
 
 
+# ---------------------------------------------------------------------------
+# Outbound media (Issue #3)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildMultipart:
+    """Tests for _build_multipart() — multipart/form-data body construction."""
+
+    def _make_adapter(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        return DingTalkAdapter(
+            PlatformConfig(enabled=True, extra={"client_id": "bot-id", "client_secret": "secret"})
+        )
+
+    def test_returns_bytes_and_boundary(self):
+        adapter = self._make_adapter()
+        body, boundary = adapter._build_multipart(b"data", "image", "photo.jpg")
+        assert isinstance(body, bytes)
+        assert isinstance(boundary, str)
+        assert len(boundary) > 0
+
+    def test_boundary_appears_in_body(self):
+        adapter = self._make_adapter()
+        body, boundary = adapter._build_multipart(b"data", "image", "photo.jpg")
+        assert boundary.encode() in body
+
+    def test_robot_code_field_present(self):
+        adapter = self._make_adapter()
+        body, _ = adapter._build_multipart(b"data", "image", "photo.jpg")
+        assert b"bot-id" in body
+
+    def test_media_type_field_present(self):
+        adapter = self._make_adapter()
+        body, _ = adapter._build_multipart(b"data", "voice", "audio.amr")
+        assert b"voice" in body
+
+    def test_filename_field_present(self):
+        adapter = self._make_adapter()
+        body, _ = adapter._build_multipart(b"data", "file", "report.pdf")
+        assert b"report.pdf" in body
+
+    def test_binary_data_embedded(self):
+        adapter = self._make_adapter()
+        payload = b"\x00\x01\x02\x03binary"
+        body, _ = adapter._build_multipart(payload, "image", "img.png")
+        assert payload in body
+
+    def test_body_ends_with_closing_boundary(self):
+        adapter = self._make_adapter()
+        body, boundary = adapter._build_multipart(b"x", "image", "x.jpg")
+        assert body.endswith(f"--{boundary}--\r\n".encode())
+
+    def test_each_call_produces_unique_boundary(self):
+        adapter = self._make_adapter()
+        _, b1 = adapter._build_multipart(b"x", "image", "a.jpg")
+        _, b2 = adapter._build_multipart(b"x", "image", "a.jpg")
+        assert b1 != b2
+
+
+class TestUploadMedia:
+    """Tests for _upload_media() — media upload to DingTalk API."""
+
+    def _make_adapter(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(
+            PlatformConfig(enabled=True, extra={"client_id": "bot-id", "client_secret": "secret"})
+        )
+        adapter._http_client = AsyncMock()
+        return adapter
+
+    def _ok_upload_resp(self, media_id="media-abc"):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"mediaId": media_id}
+        resp.text = ""
+        return resp
+
+    def _err_resp(self, status=500, text="error"):
+        resp = MagicMock()
+        resp.status_code = status
+        resp.text = text
+        return resp
+
+    @pytest.mark.asyncio
+    async def test_returns_media_id_on_success(self):
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+
+        adapter = self._make_adapter()
+        adapter._http_client.post = AsyncMock(return_value=self._ok_upload_resp("m-123"))
+
+        result = await adapter._upload_media(b"bytes", "image", "img.jpg")
+        assert result == "m-123"
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_posts_to_upload_endpoint(self):
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+
+        adapter = self._make_adapter()
+        adapter._http_client.post = AsyncMock(return_value=self._ok_upload_resp())
+
+        await adapter._upload_media(b"bytes", "image", "img.jpg")
+
+        call_url = adapter._http_client.post.call_args[0][0]
+        assert "robot/messageFiles/upload" in call_url
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_sets_multipart_content_type_header(self):
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+
+        adapter = self._make_adapter()
+        adapter._http_client.post = AsyncMock(return_value=self._ok_upload_resp())
+
+        await adapter._upload_media(b"bytes", "image", "img.jpg")
+
+        headers = adapter._http_client.post.call_args[1]["headers"]
+        assert "multipart/form-data" in headers.get("Content-Type", "")
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_http_error(self):
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+
+        adapter = self._make_adapter()
+        adapter._http_client.post = AsyncMock(return_value=self._err_resp(500))
+
+        result = await adapter._upload_media(b"bytes", "image", "img.jpg")
+        assert result is None
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_media_id_missing_in_response(self):
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+
+        adapter = self._make_adapter()
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {}  # no mediaId
+        resp.text = ""
+        adapter._http_client.post = AsyncMock(return_value=resp)
+
+        result = await adapter._upload_media(b"bytes", "image", "img.jpg")
+        assert result is None
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_returns_none_without_http_client(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._http_client = None
+        result = await adapter._upload_media(b"bytes", "image", "img.jpg")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_token_error(self):
+        import gateway.platforms.dingtalk as mod
+        mod._TOKEN_CACHE.pop("bot-id", None)
+        mod._TOKEN_LOCKS.pop("bot-id", None)
+
+        adapter = self._make_adapter()
+        bad_resp = MagicMock()
+        bad_resp.status_code = 403
+        bad_resp.text = "Forbidden"
+        adapter._http_client.post = AsyncMock(return_value=bad_resp)
+
+        result = await adapter._upload_media(b"bytes", "image", "img.jpg")
+        assert result is None
+
+
+class TestSendMediaProactive:
+    """Tests for _send_media_proactive() — media message dispatch."""
+
+    def _make_adapter(self, chat_type=None, chat_id="cidGROUP1"):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(
+            PlatformConfig(enabled=True, extra={"client_id": "bot-id", "client_secret": "secret"})
+        )
+        adapter._http_client = AsyncMock()
+        if chat_type:
+            adapter._chat_types[chat_id] = chat_type
+        return adapter
+
+    def _ok_resp(self):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.text = ""
+        return resp
+
+    def _err_resp(self, status=400, text="bad"):
+        resp = MagicMock()
+        resp.status_code = status
+        resp.text = text
+        return resp
+
+    @pytest.mark.asyncio
+    async def test_routes_to_group_endpoint(self):
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+
+        adapter = self._make_adapter()
+        adapter._http_client.post = AsyncMock(return_value=self._ok_resp())
+
+        await adapter._send_media_proactive("cidGROUP1", "sampleAudio", {"mediaId": "m1", "duration": "5"})
+
+        call_url = adapter._http_client.post.call_args[0][0]
+        assert "groupMessages/send" in call_url
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_routes_to_dm_endpoint(self):
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+
+        adapter = self._make_adapter(chat_type="dm", chat_id="dm-chat-1")
+        adapter._dm_user_ids["dm-chat-1"] = "user-999"
+        adapter._http_client.post = AsyncMock(return_value=self._ok_resp())
+
+        await adapter._send_media_proactive("dm-chat-1", "sampleFile",
+                                             {"mediaId": "m2", "fileName": "doc.pdf", "fileType": "pdf"})
+
+        call_url = adapter._http_client.post.call_args[0][0]
+        assert "oToMessages/batchSend" in call_url
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_payload_includes_msg_key_and_param(self):
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+
+        adapter = self._make_adapter()
+        adapter._http_client.post = AsyncMock(return_value=self._ok_resp())
+
+        await adapter._send_media_proactive("cidGROUP1", "sampleAudio", {"mediaId": "m1", "duration": "10"})
+
+        payload = adapter._http_client.post.call_args[1]["json"]
+        assert payload["msgKey"] == "sampleAudio"
+        msg_param = json.loads(payload["msgParam"])
+        assert msg_param["mediaId"] == "m1"
+        assert msg_param["duration"] == "10"
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_returns_success_with_message_id(self):
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+
+        adapter = self._make_adapter()
+        adapter._http_client.post = AsyncMock(return_value=self._ok_resp())
+
+        result = await adapter._send_media_proactive("cidGROUP1", "sampleMarkdown", {"title": "T", "text": "x"})
+
+        assert result.success is True
+        assert result.message_id is not None
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_returns_failure_on_http_error(self):
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+
+        adapter = self._make_adapter()
+        adapter._http_client.post = AsyncMock(return_value=self._err_resp(403, "Forbidden"))
+
+        result = await adapter._send_media_proactive("cidGROUP1", "sampleAudio", {"mediaId": "m1", "duration": "5"})
+
+        assert result.success is False
+        assert "403" in result.error
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_returns_failure_without_http_client(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._http_client = None
+        result = await adapter._send_media_proactive("cidGROUP1", "sampleAudio", {"mediaId": "m1", "duration": "5"})
+        assert result.success is False
+
+    @pytest.mark.asyncio
+    async def test_infers_group_from_cid_prefix(self):
+        """chat_id starting with 'cid' with no _chat_types entry → routed as group."""
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+
+        adapter = self._make_adapter()  # no _chat_types set
+        adapter._http_client.post = AsyncMock(return_value=self._ok_resp())
+
+        await adapter._send_media_proactive("cidUNKNOWN", "sampleMarkdown", {"title": "T", "text": "x"})
+
+        call_url = adapter._http_client.post.call_args[0][0]
+        assert "groupMessages/send" in call_url
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_infers_dm_from_non_cid_chat_id(self):
+        """chat_id not starting with 'cid' with no _chat_types entry → routed as DM."""
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+
+        adapter = self._make_adapter()  # no _chat_types set
+        adapter._http_client.post = AsyncMock(return_value=self._ok_resp())
+
+        await adapter._send_media_proactive("user-xyz", "sampleFile",
+                                             {"mediaId": "m", "fileName": "f.txt", "fileType": "txt"})
+
+        call_url = adapter._http_client.post.call_args[0][0]
+        assert "oToMessages/batchSend" in call_url
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+
+class TestGetAudioDuration:
+    """Tests for _get_audio_duration() — soft mutagen dependency."""
+
+    def test_returns_zero_when_mutagen_unavailable(self, monkeypatch):
+        monkeypatch.setattr("gateway.platforms.dingtalk.MUTAGEN_AVAILABLE", False)
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        assert DingTalkAdapter._get_audio_duration("/any/path.mp3") == 0
+
+    def test_returns_zero_when_mutagen_returns_none(self, monkeypatch):
+        monkeypatch.setattr("gateway.platforms.dingtalk.MUTAGEN_AVAILABLE", True)
+        mock_mutagen = MagicMock()
+        mock_mutagen.File.return_value = None
+        monkeypatch.setattr("gateway.platforms.dingtalk.mutagen", mock_mutagen)
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        assert DingTalkAdapter._get_audio_duration("/any/path.mp3") == 0
+
+    def test_returns_duration_from_mutagen(self, monkeypatch):
+        monkeypatch.setattr("gateway.platforms.dingtalk.MUTAGEN_AVAILABLE", True)
+        mock_audio = MagicMock()
+        mock_audio.info.length = 42.7
+        mock_mutagen = MagicMock()
+        mock_mutagen.File.return_value = mock_audio
+        monkeypatch.setattr("gateway.platforms.dingtalk.mutagen", mock_mutagen)
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        assert DingTalkAdapter._get_audio_duration("/any/path.mp3") == 42
+
+    def test_returns_at_least_one_for_sub_second_audio(self, monkeypatch):
+        monkeypatch.setattr("gateway.platforms.dingtalk.MUTAGEN_AVAILABLE", True)
+        mock_audio = MagicMock()
+        mock_audio.info.length = 0.3
+        mock_mutagen = MagicMock()
+        mock_mutagen.File.return_value = mock_audio
+        monkeypatch.setattr("gateway.platforms.dingtalk.mutagen", mock_mutagen)
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        assert DingTalkAdapter._get_audio_duration("/any/path.mp3") == 1
+
+    def test_returns_zero_on_mutagen_exception(self, monkeypatch):
+        monkeypatch.setattr("gateway.platforms.dingtalk.MUTAGEN_AVAILABLE", True)
+        mock_mutagen = MagicMock()
+        mock_mutagen.File.side_effect = Exception("parse error")
+        monkeypatch.setattr("gateway.platforms.dingtalk.mutagen", mock_mutagen)
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        assert DingTalkAdapter._get_audio_duration("/bad/path.mp3") == 0
+
+
+class TestSendImage:
+    """Tests for send_image()."""
+
+    def _make_adapter(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(
+            PlatformConfig(enabled=True, extra={"client_id": "bot-id", "client_secret": "secret"})
+        )
+        adapter._http_client = AsyncMock()
+        return adapter
+
+    def _ok_download_resp(self, data=b"\xff\xd8\xff", content_type="image/jpeg"):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.content = data
+        resp.headers = {"content-type": content_type}
+        return resp
+
+    def _ok_upload_resp(self, media_id="media-img"):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"mediaId": media_id}
+        resp.text = ""
+        return resp
+
+    def _ok_send_resp(self):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.text = ""
+        return resp
+
+    @pytest.mark.asyncio
+    async def test_sends_markdown_on_success(self):
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+
+        adapter = self._make_adapter()
+        adapter._http_client.get = AsyncMock(return_value=self._ok_download_resp())
+        adapter._http_client.post = AsyncMock(
+            side_effect=[self._ok_upload_resp(), self._ok_send_resp()]
+        )
+
+        result = await adapter.send_image("cidGROUP1", "https://example.com/img.jpg")
+
+        assert result.success is True
+        send_payload = adapter._http_client.post.call_args_list[-1][1]["json"]
+        assert send_payload["msgKey"] == "sampleMarkdown"
+        msg_param = json.loads(send_payload["msgParam"])
+        assert "https://example.com/img.jpg" in msg_param["text"]
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_includes_caption_in_markdown(self):
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+
+        adapter = self._make_adapter()
+        adapter._http_client.get = AsyncMock(return_value=self._ok_download_resp())
+        adapter._http_client.post = AsyncMock(
+            side_effect=[self._ok_upload_resp(), self._ok_send_resp()]
+        )
+
+        await adapter.send_image("cidGROUP1", "https://example.com/img.jpg", caption="My photo")
+
+        send_payload = adapter._http_client.post.call_args_list[-1][1]["json"]
+        msg_param = json.loads(send_payload["msgParam"])
+        assert "My photo" in msg_param["text"]
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_text_on_download_failure(self):
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+
+        adapter = self._make_adapter()
+        err_resp = MagicMock()
+        err_resp.status_code = 404
+        # GET fails
+        adapter._http_client.get = AsyncMock(return_value=err_resp)
+        # send() via webhook fallback succeeds
+        ok_resp = MagicMock()
+        ok_resp.status_code = 200
+        ok_resp.text = ""
+        adapter._session_webhooks["cidGROUP1"] = "https://wh.example/hook"
+        adapter._http_client.post = AsyncMock(return_value=ok_resp)
+
+        result = await adapter.send_image("cidGROUP1", "https://example.com/img.jpg")
+
+        # Falls back → webhook send
+        assert result.success is True
+        fallback_payload = adapter._http_client.post.call_args[1]["json"]
+        assert "https://example.com/img.jpg" in fallback_payload["markdown"]["text"]
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_text_on_upload_failure(self):
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+
+        adapter = self._make_adapter()
+        adapter._http_client.get = AsyncMock(return_value=self._ok_download_resp())
+        upload_err = MagicMock()
+        upload_err.status_code = 500
+        upload_err.text = "error"
+        ok_resp = MagicMock()
+        ok_resp.status_code = 200
+        ok_resp.text = ""
+        adapter._session_webhooks["cidGROUP1"] = "https://wh.example/hook"
+        adapter._http_client.post = AsyncMock(side_effect=[upload_err, ok_resp])
+
+        result = await adapter.send_image("cidGROUP1", "https://example.com/img.jpg")
+
+        assert result.success is True
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_returns_failure_without_http_client(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._http_client = None
+        result = await adapter.send_image("cidGROUP1", "https://example.com/img.jpg")
+        assert result.success is False
+
+    @pytest.mark.asyncio
+    async def test_infers_extension_from_content_type(self):
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+
+        adapter = self._make_adapter()
+        png_resp = MagicMock()
+        png_resp.status_code = 200
+        png_resp.content = b"\x89PNG"
+        png_resp.headers = {"content-type": "image/png"}
+        adapter._http_client.get = AsyncMock(return_value=png_resp)
+        adapter._http_client.post = AsyncMock(
+            side_effect=[self._ok_upload_resp(), self._ok_send_resp()]
+        )
+
+        await adapter.send_image("cidGROUP1", "https://example.com/img.png")
+
+        upload_call = adapter._http_client.post.call_args_list[0]
+        # Content-Type header should reflect multipart
+        assert "multipart/form-data" in upload_call[1]["headers"]["Content-Type"]
+        # body should contain "image.png"
+        assert b"image.png" in upload_call[1]["content"]
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+
+class TestSendVoice:
+    """Tests for send_voice()."""
+
+    def _make_adapter(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(
+            PlatformConfig(enabled=True, extra={"client_id": "bot-id", "client_secret": "secret"})
+        )
+        adapter._http_client = AsyncMock()
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_sends_audio_template(self, tmp_path):
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+
+        audio_file = tmp_path / "test.amr"
+        audio_file.write_bytes(b"fake-audio-data")
+
+        adapter = self._make_adapter()
+        upload_resp = MagicMock()
+        upload_resp.status_code = 200
+        upload_resp.json.return_value = {"mediaId": "media-audio-1"}
+        upload_resp.text = ""
+        send_resp = MagicMock()
+        send_resp.status_code = 200
+        send_resp.text = ""
+        adapter._http_client.post = AsyncMock(side_effect=[upload_resp, send_resp])
+
+        result = await adapter.send_voice("cidGROUP1", str(audio_file))
+
+        assert result.success is True
+        send_payload = adapter._http_client.post.call_args_list[-1][1]["json"]
+        assert send_payload["msgKey"] == "sampleAudio"
+        msg_param = json.loads(send_payload["msgParam"])
+        assert msg_param["mediaId"] == "media-audio-1"
+        assert "duration" in msg_param
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_text_on_upload_failure(self, tmp_path):
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+
+        audio_file = tmp_path / "test.amr"
+        audio_file.write_bytes(b"audio-data")
+
+        adapter = self._make_adapter()
+        upload_err = MagicMock()
+        upload_err.status_code = 500
+        upload_err.text = "error"
+        ok_resp = MagicMock()
+        ok_resp.status_code = 200
+        ok_resp.text = ""
+        adapter._session_webhooks["cidGROUP1"] = "https://wh.example/hook"
+        adapter._http_client.post = AsyncMock(side_effect=[upload_err, ok_resp])
+
+        result = await adapter.send_voice("cidGROUP1", str(audio_file))
+
+        assert result.success is True
+        fallback_payload = adapter._http_client.post.call_args[1]["json"]
+        assert "Audio" in fallback_payload["markdown"]["text"]
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_returns_failure_on_unreadable_file(self):
+        adapter = self._make_adapter()
+        result = await adapter.send_voice("cidGROUP1", "/nonexistent/path/audio.amr")
+        assert result.success is False
+        assert "Cannot read audio file" in result.error
+
+    @pytest.mark.asyncio
+    async def test_duration_zero_when_mutagen_unavailable(self, tmp_path, monkeypatch):
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+        monkeypatch.setattr("gateway.platforms.dingtalk.MUTAGEN_AVAILABLE", False)
+
+        audio_file = tmp_path / "test.mp3"
+        audio_file.write_bytes(b"audio-data")
+
+        adapter = self._make_adapter()
+        upload_resp = MagicMock()
+        upload_resp.status_code = 200
+        upload_resp.json.return_value = {"mediaId": "m-1"}
+        upload_resp.text = ""
+        send_resp = MagicMock()
+        send_resp.status_code = 200
+        send_resp.text = ""
+        adapter._http_client.post = AsyncMock(side_effect=[upload_resp, send_resp])
+
+        await adapter.send_voice("cidGROUP1", str(audio_file))
+
+        send_payload = adapter._http_client.post.call_args_list[-1][1]["json"]
+        msg_param = json.loads(send_payload["msgParam"])
+        assert msg_param["duration"] == "0"
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+
+class TestSendDocument:
+    """Tests for send_document()."""
+
+    def _make_adapter(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(
+            PlatformConfig(enabled=True, extra={"client_id": "bot-id", "client_secret": "secret"})
+        )
+        adapter._http_client = AsyncMock()
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_sends_file_template(self, tmp_path):
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+
+        doc = tmp_path / "report.pdf"
+        doc.write_bytes(b"pdf-content")
+
+        adapter = self._make_adapter()
+        upload_resp = MagicMock()
+        upload_resp.status_code = 200
+        upload_resp.json.return_value = {"mediaId": "media-doc-1"}
+        upload_resp.text = ""
+        send_resp = MagicMock()
+        send_resp.status_code = 200
+        send_resp.text = ""
+        adapter._http_client.post = AsyncMock(side_effect=[upload_resp, send_resp])
+
+        result = await adapter.send_document("cidGROUP1", str(doc))
+
+        assert result.success is True
+        send_payload = adapter._http_client.post.call_args_list[-1][1]["json"]
+        assert send_payload["msgKey"] == "sampleFile"
+        msg_param = json.loads(send_payload["msgParam"])
+        assert msg_param["mediaId"] == "media-doc-1"
+        assert msg_param["fileName"] == "report.pdf"
+        assert msg_param["fileType"] == "pdf"
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_uses_custom_file_name(self, tmp_path):
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+
+        doc = tmp_path / "tmp123.bin"
+        doc.write_bytes(b"data")
+
+        adapter = self._make_adapter()
+        upload_resp = MagicMock()
+        upload_resp.status_code = 200
+        upload_resp.json.return_value = {"mediaId": "m-2"}
+        upload_resp.text = ""
+        send_resp = MagicMock()
+        send_resp.status_code = 200
+        send_resp.text = ""
+        adapter._http_client.post = AsyncMock(side_effect=[upload_resp, send_resp])
+
+        await adapter.send_document("cidGROUP1", str(doc), file_name="custom_name.xlsx")
+
+        send_payload = adapter._http_client.post.call_args_list[-1][1]["json"]
+        msg_param = json.loads(send_payload["msgParam"])
+        assert msg_param["fileName"] == "custom_name.xlsx"
+        assert msg_param["fileType"] == "xlsx"
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_returns_failure_on_unreadable_file(self):
+        adapter = self._make_adapter()
+        result = await adapter.send_document("cidGROUP1", "/nonexistent/doc.pdf")
+        assert result.success is False
+        assert "Cannot read file" in result.error
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_text_on_upload_failure(self, tmp_path):
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+
+        doc = tmp_path / "data.txt"
+        doc.write_bytes(b"text content")
+
+        adapter = self._make_adapter()
+        upload_err = MagicMock()
+        upload_err.status_code = 500
+        upload_err.text = "error"
+        ok_resp = MagicMock()
+        ok_resp.status_code = 200
+        ok_resp.text = ""
+        adapter._session_webhooks["cidGROUP1"] = "https://wh.example/hook"
+        adapter._http_client.post = AsyncMock(side_effect=[upload_err, ok_resp])
+
+        result = await adapter.send_document("cidGROUP1", str(doc))
+
+        assert result.success is True
+        fallback_payload = adapter._http_client.post.call_args[1]["json"]
+        assert "File" in fallback_payload["markdown"]["text"]
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+
+class TestSendVideo:
+    """Tests for send_video()."""
+
+    def _make_adapter(self):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        adapter = DingTalkAdapter(
+            PlatformConfig(enabled=True, extra={"client_id": "bot-id", "client_secret": "secret"})
+        )
+        adapter._http_client = AsyncMock()
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_sends_video_template(self, tmp_path):
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+
+        vid = tmp_path / "clip.mp4"
+        vid.write_bytes(b"video-data-bytes")
+
+        adapter = self._make_adapter()
+        upload_resp = MagicMock()
+        upload_resp.status_code = 200
+        upload_resp.json.return_value = {"mediaId": "media-vid-1"}
+        upload_resp.text = ""
+        send_resp = MagicMock()
+        send_resp.status_code = 200
+        send_resp.text = ""
+        adapter._http_client.post = AsyncMock(side_effect=[upload_resp, send_resp])
+
+        result = await adapter.send_video("cidGROUP1", str(vid))
+
+        assert result.success is True
+        send_payload = adapter._http_client.post.call_args_list[-1][1]["json"]
+        assert send_payload["msgKey"] == "sampleVideo"
+        msg_param = json.loads(send_payload["msgParam"])
+        assert msg_param["mediaId"] == "media-vid-1"
+        assert "duration" in msg_param
+        assert "videoSize" in msg_param
+        assert msg_param["videoThumbnailURL"] == ""
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_video_size_matches_file_content(self, tmp_path):
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+
+        content = b"x" * 1234
+        vid = tmp_path / "clip.mp4"
+        vid.write_bytes(content)
+
+        adapter = self._make_adapter()
+        upload_resp = MagicMock()
+        upload_resp.status_code = 200
+        upload_resp.json.return_value = {"mediaId": "m-v"}
+        upload_resp.text = ""
+        send_resp = MagicMock()
+        send_resp.status_code = 200
+        send_resp.text = ""
+        adapter._http_client.post = AsyncMock(side_effect=[upload_resp, send_resp])
+
+        await adapter.send_video("cidGROUP1", str(vid))
+
+        send_payload = adapter._http_client.post.call_args_list[-1][1]["json"]
+        msg_param = json.loads(send_payload["msgParam"])
+        assert msg_param["videoSize"] == str(len(content))
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_returns_failure_on_unreadable_file(self):
+        adapter = self._make_adapter()
+        result = await adapter.send_video("cidGROUP1", "/nonexistent/video.mp4")
+        assert result.success is False
+        assert "Cannot read video file" in result.error
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_text_on_upload_failure(self, tmp_path):
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+
+        vid = tmp_path / "clip.mp4"
+        vid.write_bytes(b"video")
+
+        adapter = self._make_adapter()
+        upload_err = MagicMock()
+        upload_err.status_code = 500
+        upload_err.text = "error"
+        ok_resp = MagicMock()
+        ok_resp.status_code = 200
+        ok_resp.text = ""
+        adapter._session_webhooks["cidGROUP1"] = "https://wh.example/hook"
+        adapter._http_client.post = AsyncMock(side_effect=[upload_err, ok_resp])
+
+        result = await adapter.send_video("cidGROUP1", str(vid))
+
+        assert result.success is True
+        fallback_payload = adapter._http_client.post.call_args[1]["json"]
+        assert "Video" in fallback_payload["markdown"]["text"]
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+
 class TestPlatformEnum:
 
     def test_dingtalk_in_platform_enum(self):
