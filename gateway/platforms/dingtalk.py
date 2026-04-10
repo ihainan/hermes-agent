@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import time
 import uuid
 from datetime import datetime, timezone
@@ -47,6 +48,9 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    cache_image_from_bytes,
+    cache_audio_from_bytes,
+    cache_document_from_bytes,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,6 +59,10 @@ MAX_MESSAGE_LENGTH = 20000
 DEDUP_WINDOW_SECONDS = 300
 DEDUP_MAX_SIZE = 1000
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
+MAX_RECONNECT_ATTEMPTS = 10
+HEALTH_CHECK_INTERVAL = 30          # seconds between health check polls
+HEALTH_CHECK_STALE_THRESHOLD = 120  # seconds without a message before reconnect
+RECONNECT_JITTER_FACTOR = 0.2       # ±20% jitter applied to backoff delays
 
 # OAuth token management
 _DINGTALK_API_BASE = "https://api.dingtalk.com/v1.0"
@@ -97,7 +105,11 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         self._stream_client: Any = None
         self._stream_task: Optional[asyncio.Task] = None
+        self._health_check_task: Optional[asyncio.Task] = None
         self._http_client: Optional["httpx.AsyncClient"] = None
+
+        self._last_message_at: float = 0.0
+        self._consecutive_failures: int = 0
 
         # Message deduplication: msg_id -> timestamp
         self._seen_messages: Dict[str, float] = {}
@@ -123,18 +135,11 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         try:
             self._http_client = httpx.AsyncClient(timeout=30.0)
-
-            credential = dingtalk_stream.Credential(self._client_id, self._client_secret)
-            self._stream_client = dingtalk_stream.DingTalkStreamClient(credential)
-
-            # Capture the current event loop for cross-thread dispatch
-            loop = asyncio.get_running_loop()
-            handler = _IncomingHandler(self, loop)
-            self._stream_client.register_callback_handler(
-                dingtalk_stream.ChatbotMessage.TOPIC, handler
-            )
+            self._last_message_at = time.monotonic()
+            self._consecutive_failures = 0
 
             self._stream_task = asyncio.create_task(self._run_stream())
+            self._health_check_task = asyncio.create_task(self._health_check_loop())
             self._mark_connected()
             logger.info("[%s] Connected via Stream Mode", self.name)
 
@@ -152,24 +157,57 @@ class DingTalkAdapter(BasePlatformAdapter):
             return False
 
     async def _run_stream(self) -> None:
-        """Run the blocking stream client with auto-reconnection."""
+        """Run the stream client with auto-reconnection, jitter, and failure cap.
+
+        Rebuilds a fresh DingTalkStreamClient on each attempt (warm reconnect).
+        Applies ±20% jitter to backoff delays to avoid thundering herd.
+        Calls _set_fatal_error() after MAX_RECONNECT_ATTEMPTS consecutive failures.
+        """
         backoff_idx = 0
         while self._running:
             try:
-                logger.debug("[%s] Starting stream client...", self.name)
+                logger.info("[%s] Starting stream client (consecutive failures: %d)...",
+                            self.name, self._consecutive_failures)
+                # Rebuild fresh client on each attempt — clears any stale internal state.
+                credential = dingtalk_stream.Credential(self._client_id, self._client_secret)
+                self._stream_client = dingtalk_stream.DingTalkStreamClient(credential)
+                loop = asyncio.get_running_loop()
+                handler = _IncomingHandler(self, loop)
+                self._stream_client.register_callback_handler(
+                    dingtalk_stream.ChatbotMessage.TOPIC, handler
+                )
+
                 await asyncio.to_thread(self._stream_client.start)
+                # Clean exit from SDK — reset failure counter and backoff.
+                self._consecutive_failures = 0
+                backoff_idx = 0
+
             except asyncio.CancelledError:
                 return
             except Exception as e:
                 if not self._running:
                     return
-                logger.warning("[%s] Stream client error: %s", self.name, e)
+                self._consecutive_failures += 1
+                logger.warning(
+                    "[%s] Stream error (failure %d/%d): %s",
+                    self.name, self._consecutive_failures, MAX_RECONNECT_ATTEMPTS, e,
+                )
+                if self._consecutive_failures >= MAX_RECONNECT_ATTEMPTS:
+                    logger.error("[%s] Max reconnect attempts reached, giving up", self.name)
+                    self._set_fatal_error(
+                        "dingtalk_stream_error",
+                        f"Stream failed {MAX_RECONNECT_ATTEMPTS} consecutive times: {e}",
+                        retryable=True,
+                    )
+                    return
 
             if not self._running:
                 return
 
-            delay = RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF) - 1)]
-            logger.info("[%s] Reconnecting in %ds...", self.name, delay)
+            raw_delay = RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF) - 1)]
+            jitter = raw_delay * RECONNECT_JITTER_FACTOR * (2 * random.random() - 1)
+            delay = max(0.1, raw_delay + jitter)
+            logger.info("[%s] Reconnecting in %.1fs...", self.name, delay)
             await asyncio.sleep(delay)
             backoff_idx += 1
 
@@ -186,30 +224,74 @@ class DingTalkAdapter(BasePlatformAdapter):
                 pass
             self._stream_task = None
 
+        if self._health_check_task:
+            self._health_check_task.cancel()
+            try:
+                await self._health_check_task
+            except asyncio.CancelledError:
+                pass
+            self._health_check_task = None
+
         if self._http_client:
             await self._http_client.aclose()
             self._http_client = None
 
         self._stream_client = None
+        self._consecutive_failures = 0
         self._session_webhooks.clear()
         self._seen_messages.clear()
         self._chat_types.clear()
         self._dm_user_ids.clear()
         logger.info("[%s] Disconnected", self.name)
 
+    async def _health_check_loop(self) -> None:
+        """Background task: detect silent WebSocket stalls and trigger reconnect.
+
+        Checks every HEALTH_CHECK_INTERVAL seconds. If no message has arrived
+        in HEALTH_CHECK_STALE_THRESHOLD seconds, cancels the stream task so
+        _run_stream() will rebuild a fresh client and reconnect.
+        """
+        while self._running:
+            await asyncio.sleep(HEALTH_CHECK_INTERVAL)
+            if not self._running:
+                return
+            idle = time.monotonic() - self._last_message_at
+            if idle > HEALTH_CHECK_STALE_THRESHOLD:
+                logger.warning(
+                    "[%s] No message received for %.0fs, triggering reconnect",
+                    self.name, idle,
+                )
+                if self._stream_task and not self._stream_task.done():
+                    self._stream_task.cancel()
+
     # -- Inbound message processing -----------------------------------------
 
     async def _on_message(self, message: "ChatbotMessage") -> None:
         """Process an incoming DingTalk chatbot message."""
+        self._last_message_at = time.monotonic()
         msg_id = getattr(message, "message_id", None) or uuid.uuid4().hex
         if self._is_duplicate(msg_id):
             logger.debug("[%s] Duplicate message %s, skipping", self.name, msg_id)
             return
 
-        text = self._extract_text(message)
-        if not text:
+        # Parse message content (text + media) based on msgtype
+        text, message_type, media_urls, media_types = await self._parse_inbound_message(message)
+        if not text and not media_urls:
             logger.debug("[%s] Empty message, skipping", self.name)
             return
+
+        # Quoted/replied message context
+        reply_to_text, reply_to_message_id = self._extract_quoted_context(message)
+        if reply_to_text:
+            # Extract the original sender from repliedMsg (not the current sender)
+            raw_text = getattr(message, "text", None) or {}
+            if isinstance(raw_text, dict):
+                replied = raw_text.get("repliedMsg") or {}
+                quoted_sender = replied.get("msgSenderNick", "") if isinstance(replied, dict) else ""
+            else:
+                quoted_sender = ""
+            prefix = f'[Replying to {quoted_sender}: "{reply_to_text}"]\n' if quoted_sender else f'[Replying to: "{reply_to_text}"]\n'
+            text = prefix + text
 
         # Chat context
         conversation_id = getattr(message, "conversation_id", "") or ""
@@ -250,16 +332,181 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         event = MessageEvent(
             text=text,
-            message_type=MessageType.TEXT,
+            message_type=message_type,
             source=source,
             message_id=msg_id,
             raw_message=message,
             timestamp=timestamp,
+            reply_to_message_id=reply_to_message_id,
+            reply_to_text=reply_to_text,
+            media_urls=media_urls,
+            media_types=media_types,
         )
 
-        logger.debug("[%s] Message from %s in %s: %s",
-                      self.name, sender_nick, chat_id[:20] if chat_id else "?", text[:50])
+        logger.debug("[%s] Message from %s in %s (%s): %s",
+                     self.name, sender_nick, chat_id[:20] if chat_id else "?",
+                     message_type.value, text[:50])
         await self.handle_message(event)
+
+    async def _parse_inbound_message(
+        self, message: "ChatbotMessage"
+    ) -> "tuple[str, MessageType, list, list]":
+        """Parse an inbound DingTalk message into (text, message_type, media_urls, media_types).
+
+        Handles msgtype: text, picture, audio, video, file, richText.
+        Downloads media via _download_media() and caches locally.
+        On download failure falls back to text-only (never drops the message).
+        """
+        msgtype = getattr(message, "msgtype", None) or "text"
+        content = getattr(message, "content", None) or {}
+        if not isinstance(content, dict):
+            content = {}
+
+        media_urls: list = []
+        media_types: list = []
+
+        if msgtype == "picture":
+            download_code = content.get("downloadCode", "")
+            if download_code:
+                path, mime = await self._download_media(download_code, "image/jpeg", ".jpg")
+                if path:
+                    media_urls.append(path)
+                    media_types.append(mime)
+            text = content.get("caption", "") or ""
+            return text, MessageType.PHOTO, media_urls, media_types
+
+        if msgtype == "audio":
+            download_code = content.get("downloadCode", "")
+            if download_code:
+                path, mime = await self._download_media(download_code, "audio/amr", ".amr")
+                if path:
+                    media_urls.append(path)
+                    media_types.append(mime)
+            return "", MessageType.VOICE, media_urls, media_types
+
+        if msgtype == "video":
+            download_code = content.get("downloadCode", "")
+            if download_code:
+                path, mime = await self._download_media(download_code, "video/mp4", ".mp4")
+                if path:
+                    media_urls.append(path)
+                    media_types.append(mime)
+            return "", MessageType.VIDEO, media_urls, media_types
+
+        if msgtype == "file":
+            download_code = content.get("downloadCode", "")
+            file_name = content.get("fileName", "document") or "document"
+            if download_code:
+                path, mime = await self._download_media(
+                    download_code, "application/octet-stream", None, file_name
+                )
+                if path:
+                    media_urls.append(path)
+                    media_types.append(mime)
+            return file_name, MessageType.DOCUMENT, media_urls, media_types
+
+        if msgtype == "richText":
+            rich_parts = content.get("richText", []) or []
+            text_parts = []
+            for part in rich_parts:
+                if not isinstance(part, dict):
+                    continue
+                part_type = part.get("type", "text")
+                if part_type in ("text", None) and part.get("text"):
+                    text_parts.append(part["text"])
+                elif part_type == "picture":
+                    download_code = part.get("downloadCode", "")
+                    if download_code:
+                        path, mime = await self._download_media(
+                            download_code, "image/jpeg", ".jpg"
+                        )
+                        if path:
+                            media_urls.append(path)
+                            media_types.append(mime)
+            text = "".join(text_parts).strip()
+            msg_type = MessageType.PHOTO if media_urls else MessageType.TEXT
+            return text, msg_type, media_urls, media_types
+
+        # Default: plain text (msgtype == "text" or unknown)
+        text = self._extract_text(message)
+        return text, MessageType.TEXT, [], []
+
+    async def _download_media(
+        self,
+        download_code: str,
+        default_mime: str,
+        default_ext: "Optional[str]",
+        filename: str = "",
+    ) -> "tuple[Optional[str], str]":
+        """Download a DingTalk media file and cache it locally.
+
+        POSTs downloadCode to the DingTalk API to obtain a temporary download URL,
+        then GETs the file bytes and caches them via the base class helpers.
+
+        Returns (local_path, mime_type) on success, (None, default_mime) on failure.
+        """
+        if not self._http_client:
+            logger.warning("[%s] HTTP client not available for media download", self.name)
+            return None, default_mime
+
+        try:
+            headers = await self._dingtalk_headers()
+        except RuntimeError as e:
+            logger.warning("[%s] Cannot download media — token error: %s", self.name, e)
+            return None, default_mime
+
+        try:
+            resp = await self._http_client.post(
+                f"{_DINGTALK_API_BASE}/robot/messageFiles/download",
+                json={"downloadCode": download_code, "robotCode": self._client_id},
+                headers=headers,
+                timeout=15.0,
+            )
+            if resp.status_code >= 300:
+                logger.warning(
+                    "[%s] Media download exchange failed HTTP %d: %s",
+                    self.name, resp.status_code, resp.text[:200],
+                )
+                return None, default_mime
+
+            data = resp.json()
+            download_url = data.get("downloadUrl") or (data.get("data") or {}).get("downloadUrl")
+            if not download_url:
+                logger.warning("[%s] No downloadUrl in media response: %s", self.name, str(data)[:200])
+                return None, default_mime
+
+        except Exception as e:
+            logger.warning("[%s] Media download exchange error: %s", self.name, e)
+            return None, default_mime
+
+        try:
+            file_resp = await self._http_client.get(download_url, timeout=30.0, follow_redirects=True)
+            if file_resp.status_code >= 300:
+                logger.warning(
+                    "[%s] Media file fetch failed HTTP %d", self.name, file_resp.status_code
+                )
+                return None, default_mime
+
+            file_bytes = file_resp.content
+            content_type = file_resp.headers.get("content-type", default_mime).split(";")[0].strip()
+
+            # Choose cache helper based on MIME type
+            if content_type.startswith("image/"):
+                ext = default_ext or ("." + content_type.split("/")[-1]) or ".jpg"
+                path = cache_image_from_bytes(file_bytes, ext)
+            elif content_type.startswith("audio/"):
+                ext = default_ext or ("." + content_type.split("/")[-1]) or ".amr"
+                path = cache_audio_from_bytes(file_bytes, ext)
+            else:
+                safe_name = filename or f"media{default_ext or ''}"
+                path = cache_document_from_bytes(file_bytes, safe_name)
+
+            logger.debug("[%s] Media cached at %s (%s)", self.name, path, content_type)
+            return path, content_type
+
+        except Exception as e:
+            logger.warning("[%s] Media file download error: %s", self.name, e)
+            return None, default_mime
 
     @staticmethod
     def _extract_text(message: "ChatbotMessage") -> str:
@@ -278,6 +525,27 @@ class DingTalkAdapter(BasePlatformAdapter):
                          if isinstance(item, dict) and item.get("text")]
                 content = " ".join(parts).strip()
         return content
+
+    @staticmethod
+    def _extract_quoted_context(message: "ChatbotMessage") -> tuple:
+        """Extract quoted/replied message context from a DingTalk inbound message.
+
+        Returns (reply_to_text, reply_to_message_id). Both are None if the
+        message is not a reply or if quoted fields are absent/malformed.
+        """
+        raw_text = getattr(message, "text", None) or {}
+        if not isinstance(raw_text, dict):
+            return None, None
+        if not raw_text.get("isReplyMsg"):
+            return None, None
+
+        replied = raw_text.get("repliedMsg")
+        if not replied or not isinstance(replied, dict):
+            return None, None
+
+        msg_content = replied.get("msgContent") or ""
+        msg_id = replied.get("msgId") or None
+        return (msg_content.strip() or None), msg_id
 
     # -- OAuth token management ---------------------------------------------
 
