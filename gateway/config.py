@@ -288,6 +288,9 @@ class GatewayConfig:
             # WeCom uses extra dict for bot credentials
             elif platform == Platform.WECOM and config.extra.get("bot_id"):
                 connected.append(platform)
+            # DingTalk uses extra dict for app credentials
+            elif platform == Platform.DINGTALK and config.extra.get("client_id"):
+                connected.append(platform)
             # BlueBubbles uses extra dict for local server config
             elif platform == Platform.BLUEBUBBLES and config.extra.get("server_url") and config.extra.get("password"):
                 connected.append(platform)

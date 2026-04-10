@@ -71,6 +71,30 @@ class TestGetConnectedPlatforms:
         config = GatewayConfig()
         assert config.get_connected_platforms() == []
 
+    def test_dingtalk_with_client_id_in_extra(self):
+        config = GatewayConfig(platforms={
+            Platform.DINGTALK: PlatformConfig(
+                enabled=True,
+                extra={"client_id": "app-key", "client_secret": "app-secret"},
+            )
+        })
+        assert Platform.DINGTALK in config.get_connected_platforms()
+
+    def test_dingtalk_without_client_id_not_connected(self):
+        config = GatewayConfig(platforms={
+            Platform.DINGTALK: PlatformConfig(enabled=True, extra={})
+        })
+        assert Platform.DINGTALK not in config.get_connected_platforms()
+
+    def test_dingtalk_disabled_not_connected(self):
+        config = GatewayConfig(platforms={
+            Platform.DINGTALK: PlatformConfig(
+                enabled=False,
+                extra={"client_id": "app-key", "client_secret": "app-secret"},
+            )
+        })
+        assert Platform.DINGTALK not in config.get_connected_platforms()
+
 
 class TestSessionResetPolicy:
     def test_roundtrip(self):
