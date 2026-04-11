@@ -7667,19 +7667,24 @@ def main():
     parser = argparse.ArgumentParser(description="Hermes Gateway - Multi-platform messaging")
     parser.add_argument("--config", "-c", help="Path to gateway config file")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
-    
+    parser.add_argument(
+        "--replace", "-r",
+        action="store_true",
+        help="Gracefully stop any existing gateway instance (SIGTERM) before starting",
+    )
+
     args = parser.parse_args()
-    
+
     config = None
     if args.config:
         import json
         with open(args.config, encoding="utf-8") as f:
             data = json.load(f)
             config = GatewayConfig.from_dict(data)
-    
+
     # Run the gateway - exit with code 1 if no platforms connected,
     # so systemd Restart=on-failure will retry on transient errors (e.g. DNS)
-    success = asyncio.run(start_gateway(config, verbosity=1 if args.verbose else 0))
+    success = asyncio.run(start_gateway(config, replace=args.replace, verbosity=1 if args.verbose else 0))
     if not success:
         sys.exit(1)
 
