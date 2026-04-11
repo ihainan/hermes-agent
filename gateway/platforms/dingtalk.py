@@ -1087,7 +1087,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             headers = await self._dingtalk_headers()
             resp = await self._http_client.post(
                 f"{_DINGTALK_API_BASE}/robot/emotion/reply",
-                json={"robotCode": self._client_id, "msgId": msg_id, "conversationId": chat_id, "emojiType": emoji},
+                json={"robotCode": self._client_id, "openMsgId": msg_id, "openConversationId": chat_id, "emojiType": emoji},
                 headers=headers,
                 timeout=5.0,
             )
@@ -1110,7 +1110,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             await self._http_client.request(
                 "DELETE",
                 f"{_DINGTALK_API_BASE}/robot/emotion/recall",
-                json={"robotCode": self._client_id, "msgId": msg_id, "conversationId": chat_id, "emojiType": emoji},
+                json={"robotCode": self._client_id, "openMsgId": msg_id, "openConversationId": chat_id, "emojiType": emoji},
                 headers=headers,
                 timeout=5.0,
             )

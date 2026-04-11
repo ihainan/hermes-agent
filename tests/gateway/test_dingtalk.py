@@ -2086,8 +2086,8 @@ class TestReactionHelpers:
         call_url = adapter._http_client.post.call_args[0][0]
         assert "robot/emotion/reply" in call_url
         body = adapter._http_client.post.call_args[1]["json"]
-        assert body["msgId"] == "msg-1"
-        assert body["conversationId"] == "cid-chat"
+        assert body["openMsgId"] == "msg-1"
+        assert body["openConversationId"] == "cid-chat"
         assert body["emojiType"] == "⏳"
         self._clear_token()
 
@@ -2123,7 +2123,8 @@ class TestReactionHelpers:
         assert call_method == "DELETE"
         assert "robot/emotion/recall" in call_url
         body = adapter._http_client.request.call_args[1]["json"]
-        assert body["msgId"] == "msg-1"
+        assert body["openMsgId"] == "msg-1"
+        assert body["openConversationId"] == "cid-chat"
         assert body["emojiType"] == "⏳"
         self._clear_token()
 
