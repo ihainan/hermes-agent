@@ -148,14 +148,6 @@ class DingTalkAdapter(BasePlatformAdapter):
                 "backgroundId": "im_bg_1",
             },
         }
-        # Track in-flight reactions: msg_id → chat_id
-        self._pending_reactions: Dict[str, str] = {}
-        # Reverse mapping for fallback cleanup when msg_id is unavailable (e.g. queued messages)
-        self._chat_pending_msg_ids: Dict[str, List[str]] = {}
-        # Messages dequeued by get_pending_message() but not yet responded to.
-        # When run.py pops a queued message without a matching send(reply_to=msg_id),
-        # we collect the msg_ids here and clean their reactions on the next send.
-        self._dequeued_reactions: Dict[str, List[str]] = {}  # chat_id → [msg_ids]
 
     # -- Connection lifecycle -----------------------------------------------
 
@@ -305,7 +297,6 @@ class DingTalkAdapter(BasePlatformAdapter):
         self._seen_messages.clear()
         self._chat_types.clear()
         self._dm_user_ids.clear()
-        self._pending_reactions.clear()
         logger.info("[%s] Disconnected", self.name)
 
     # -- Inbound message processing -----------------------------------------
@@ -397,13 +388,13 @@ class DingTalkAdapter(BasePlatformAdapter):
                      self.name, sender_nick, chat_id[:20] if chat_id else "?",
                      message_type.value, text[:50])
 
-        # Acknowledge receipt with a reaction before the agent starts (issue #6)
+        # Acknowledge receipt with a persistent reaction (add-and-leave, like Feishu).
+        # The reaction stays on the message permanently as a delivery receipt —
+        # no removal on response, eliminating the complex lifecycle state that
+        # caused spurious removal bugs (see ihainan/hermes-agent#23).
         if self._ack_reaction_enabled and chat_id:
             await self._add_reaction(msg_id, chat_id)
-            self._pending_reactions[msg_id] = chat_id
-            self._chat_pending_msg_ids.setdefault(chat_id, []).append(msg_id)
-            logger.info("[%s] reaction added: msg_id=%s pending=%s",
-                        self.name, msg_id, list(self._pending_reactions.keys()))
+            logger.info("[%s] reaction added (persistent ACK): msg_id=%s", self.name, msg_id)
 
         await self.handle_message(event)
 
@@ -766,9 +757,6 @@ class DingTalkAdapter(BasePlatformAdapter):
         proactive robot API when no webhook is cached for the chat_id, enabling
         cron delivery and agent-initiated sends.
 
-        After sending, updates the emoji reaction on the triggering message
-        to ✅ (success) or ❌ (failure). reply_to carries the inbound msg_id
-        so the correct reaction can be found in _pending_reactions.
         """
         metadata = metadata or {}
 
@@ -789,7 +777,6 @@ class DingTalkAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("[%s] Token error before session_webhook send, falling back to proactive: %s", self.name, e)
                 result = await self._send_proactive(chat_id, content)
-                await self._finalize_reaction(reply_to, result, chat_id)
                 return result
 
             _session_result: Optional[SendResult] = None
@@ -816,7 +803,6 @@ class DingTalkAdapter(BasePlatformAdapter):
             logger.debug("[%s] No session_webhook for %s, using proactive API", self.name, chat_id[:20])
             result = await self._send_proactive(chat_id, content)
 
-        await self._finalize_reaction(reply_to, result, chat_id)
         return result
 
     async def _send_proactive(self, chat_id: str, content: str) -> SendResult:
@@ -1024,7 +1010,6 @@ class DingTalkAdapter(BasePlatformAdapter):
         ) or await self._send_media_proactive(chat_id, "sampleImageMsg", {"photoURL": media_id})
         if caption and result.success:
             await self.send(chat_id, caption, reply_to=reply_to, metadata=metadata)
-        await self._finalize_reaction(reply_to, result, chat_id)
         return result
 
     async def send_voice(
@@ -1063,7 +1048,6 @@ class DingTalkAdapter(BasePlatformAdapter):
             chat_id, "sampleAudio",
             {"mediaId": media_id, "duration": str(duration_ms)},
         )
-        await self._finalize_reaction(reply_to, result, chat_id)
         return result
 
     async def send_document(
@@ -1101,7 +1085,6 @@ class DingTalkAdapter(BasePlatformAdapter):
             chat_id, "sampleFile",
             {"mediaId": media_id, "fileName": filename, "fileType": file_type},
         )
-        await self._finalize_reaction(reply_to, result, chat_id)
         return result
 
     async def send_video(
@@ -1141,7 +1124,6 @@ class DingTalkAdapter(BasePlatformAdapter):
         )
         if caption and result.success:
             await self.send(chat_id, caption, reply_to=reply_to, metadata=metadata)
-        await self._finalize_reaction(reply_to, result, chat_id)
         return result
 
     async def _upload_media(
@@ -1276,12 +1258,15 @@ class DingTalkAdapter(BasePlatformAdapter):
     # -- Emoji reaction acknowledgment (issue #6) ---------------------------
 
     async def _add_reaction(self, msg_id: str, chat_id: str) -> None:
-        """Attach the DingTalk native "thinking" reaction to an inbound message.
+        """Add a persistent ACK reaction to an inbound message (add-and-leave).
 
-        Calls POST /v1.0/robot/emotion/reply with the platform-specific
-        textEmotion payload. Failures are non-fatal (reactions are cosmetic).
-        Retries up to 3 times on transient 5xx errors, matching the reference
-        implementation's retry pattern.
+        Mirrors Feishu's _add_ack_reaction design: the reaction is added once
+        as a delivery receipt and never removed. This avoids the complex
+        add-and-remove lifecycle that was prone to orphaned or prematurely
+        cleared reactions (ihainan/hermes-agent#23).
+
+        Calls POST /v1.0/robot/emotion/reply. Failures are non-fatal.
+        Retries up to 3 times on transient 5xx errors.
         """
         if not self._http_client:
             return
@@ -1315,118 +1300,6 @@ class DingTalkAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("[%s] _add_reaction failed (non-fatal, attempt %d): %s", self.name, i + 1, e)
                 return
-
-    async def _remove_reaction(self, msg_id: str, chat_id: str) -> None:
-        """Recall the DingTalk native "thinking" reaction from a message.
-
-        Calls POST /v1.0/robot/emotion/recall. Retries up to 3 times on
-        transient failures (reference impl uses delays [0, 1.5s, 5s]).
-        """
-        if not self._http_client:
-            return
-        body = {
-            "robotCode": self._client_id,
-            "openMsgId": msg_id,
-            "openConversationId": chat_id,
-            **self._THINKING_EMOTION_PAYLOAD,
-        }
-        delays = [0, 1.5, 5.0]
-        for i, delay in enumerate(delays):
-            if delay:
-                await asyncio.sleep(delay)
-            try:
-                headers = await self._dingtalk_headers()
-                resp = await self._http_client.post(
-                    f"{_DINGTALK_API_BASE}/robot/emotion/recall",
-                    json=body,
-                    headers=headers,
-                    timeout=5.0,
-                )
-                if resp.status_code < 300:
-                    logger.debug("[%s] _remove_reaction OK (attempt %d)", self.name, i + 1)
-                    return
-                if resp.status_code < 500:
-                    return  # non-retryable
-            except Exception as e:
-                logger.warning("[%s] _remove_reaction failed (non-fatal, attempt %d): %s", self.name, i + 1, e)
-                return
-
-    async def _finalize_reaction(
-        self, msg_id: Optional[str], result: SendResult, chat_id: Optional[str] = None
-    ) -> None:
-        """Recall the pending "thinking" reaction after a send completes.
-
-        The native DingTalk reaction flow only supports attach-then-recall.
-        We always recall regardless of send success/failure.
-
-        When msg_id is known (normal path), look it up directly in _pending_reactions.
-        When msg_id is None (queued message path — run.py loses the id after dequeue),
-        fall back to the oldest pending reaction for the given chat_id so that the
-        reaction is never left orphaned.
-        """
-        if not self._ack_reaction_enabled:
-            logger.debug("[%s] _finalize_reaction skipped: enabled=%s", self.name, self._ack_reaction_enabled)
-            return
-
-        logger.info("[%s] _finalize_reaction called: msg_id=%r chat_id=%r pending=%s chat_queue=%s",
-                    self.name, msg_id, chat_id,
-                    list(self._pending_reactions.keys()),
-                    {k: v for k, v in self._chat_pending_msg_ids.items() if v})
-
-        if msg_id:
-            resolved_chat_id = self._pending_reactions.pop(msg_id, None)
-            if resolved_chat_id:
-                # Normal path: found and consumed the pending reaction.
-                pending = self._chat_pending_msg_ids.get(resolved_chat_id, [])
-                if msg_id in pending:
-                    pending.remove(msg_id)
-                logger.info("[%s] _finalize_reaction normal: removing reaction msg_id=%r", self.name, msg_id)
-                await self._remove_reaction(msg_id, resolved_chat_id)
-            elif chat_id:
-                # msg_id was already consumed by the first_response send (run.py line 7373
-                # sends first_response with reply_to=None, which pops msg_id via fallback
-                # below). This second call carries reply_to=original_msg_id from base.py's
-                # _process_message_background and represents the queued message's response.
-                # Clean up the next oldest pending reaction for this chat.
-                pending = self._chat_pending_msg_ids.get(chat_id, [])
-                if pending:
-                    oldest_msg_id = pending.pop(0)
-                    self._pending_reactions.pop(oldest_msg_id, None)
-                    logger.info("[%s] _finalize_reaction stale-id fallback: removing msg_id=%r", self.name, oldest_msg_id)
-                    await self._remove_reaction(oldest_msg_id, chat_id)
-                else:
-                    logger.info("[%s] _finalize_reaction stale-id fallback: no pending for chat %r", self.name, chat_id)
-        elif chat_id:
-            # reply_to was None.  This fires in two distinct situations:
-            #
-            #   (a) Queued first_response: run.py finishes processing message A and
-            #       sends A's final answer before recursing into queued message C.
-            #       At this point pending = [A, C] — len >= 2.  We should remove A.
-            #
-            #   (b) Ancillary sends: home-channel notice, context-injection errors,
-            #       etc. that fire quickly (< 1s) before the LLM has even started.
-            #       At this point pending = [B] — len == 1.  Removing B here would
-            #       leave the message with no reaction during the entire LLM call.
-            #
-            # Guard: only fire when there are >= 2 pending reactions.  If only one
-            # reaction is pending, this send is almost certainly an ancillary send
-            # rather than the queued first_response (which always has a queued
-            # successor already in the list).
-            pending = self._chat_pending_msg_ids.get(chat_id, [])
-            if not pending:
-                logger.info("[%s] _finalize_reaction None-fallback: no pending for chat %r", self.name, chat_id)
-                return
-            if len(pending) < 2:
-                logger.info(
-                    "[%s] _finalize_reaction None-fallback: skipping — only 1 pending reaction "
-                    "(ancillary send, not queued first_response) chat=%r msg_id=%r",
-                    self.name, chat_id, pending[0],
-                )
-                return
-            oldest_msg_id = pending.pop(0)
-            self._pending_reactions.pop(oldest_msg_id, None)
-            logger.info("[%s] _finalize_reaction None-fallback: removing msg_id=%r", self.name, oldest_msg_id)
-            await self._remove_reaction(oldest_msg_id, chat_id)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """DingTalk does not support typing indicators."""

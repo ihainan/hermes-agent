@@ -2069,7 +2069,7 @@ class TestPlatformEnum:
 
 
 class TestReactionHelpers:
-    """Unit tests for _add_reaction() and _remove_reaction()."""
+    """Unit tests for _add_reaction() — persistent ACK, add-and-leave design."""
 
     def _make_adapter(self):
         from gateway.platforms.dingtalk import DingTalkAdapter
@@ -2124,117 +2124,6 @@ class TestReactionHelpers:
         await adapter._add_reaction("msg-1", "cid-chat")
         self._clear_token()
 
-    @pytest.mark.asyncio
-    async def test_remove_reaction_posts_to_emotion_recall(self):
-        self._token()
-        adapter = self._make_adapter()
-        ok = MagicMock()
-        ok.status_code = 200
-        adapter._http_client.post = AsyncMock(return_value=ok)
-
-        await adapter._remove_reaction("msg-1", "cid-chat")
-
-        call_url = adapter._http_client.post.call_args[0][0]
-        assert "robot/emotion/recall" in call_url
-        body = adapter._http_client.post.call_args[1]["json"]
-        assert body["openMsgId"] == "msg-1"
-        assert body["openConversationId"] == "cid-chat"
-        assert body["emotionType"] == 2
-        self._clear_token()
-
-    @pytest.mark.asyncio
-    async def test_remove_reaction_is_noop_without_http_client(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter
-        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
-        adapter._http_client = None
-        await adapter._remove_reaction("msg-1", "cid-chat")
-
-    @pytest.mark.asyncio
-    async def test_remove_reaction_ignores_api_error(self):
-        self._token()
-        adapter = self._make_adapter()
-        adapter._http_client.post = AsyncMock(side_effect=Exception("network error"))
-        await adapter._remove_reaction("msg-1", "cid-chat")
-        self._clear_token()
-
-
-class TestFinalizeReaction:
-    """Unit tests for _finalize_reaction()."""
-
-    def _make_adapter(self, ack="emoji"):
-        from gateway.platforms.dingtalk import DingTalkAdapter
-        adapter = DingTalkAdapter(
-            PlatformConfig(enabled=True, extra={"client_id": "bot-id", "client_secret": "secret",
-                                                "ack_reaction": ack})
-        )
-        adapter._http_client = AsyncMock()
-        return adapter
-
-    @pytest.mark.asyncio
-    async def test_recalls_reaction_on_success(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter, SendResult
-        adapter = self._make_adapter()
-        adapter._pending_reactions["msg-1"] = "cid-chat"
-
-        with patch.object(adapter, "_remove_reaction", new_callable=AsyncMock) as mock_rm, \
-             patch.object(adapter, "_add_reaction", new_callable=AsyncMock) as mock_add:
-            await adapter._finalize_reaction("msg-1", SendResult(success=True))
-
-        mock_rm.assert_awaited_once_with("msg-1", "cid-chat")
-        mock_add.assert_not_awaited()
-        assert "msg-1" not in adapter._pending_reactions
-
-    @pytest.mark.asyncio
-    async def test_recalls_reaction_on_failure(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter, SendResult
-        adapter = self._make_adapter()
-        adapter._pending_reactions["msg-1"] = "cid-chat"
-
-        with patch.object(adapter, "_remove_reaction", new_callable=AsyncMock) as mock_rm, \
-             patch.object(adapter, "_add_reaction", new_callable=AsyncMock) as mock_add:
-            await adapter._finalize_reaction("msg-1", SendResult(success=False, error="oops"))
-
-        mock_rm.assert_awaited_once_with("msg-1", "cid-chat")
-        mock_add.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_noop_when_msg_id_not_tracked(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter, SendResult
-        adapter = self._make_adapter()
-
-        with patch.object(adapter, "_remove_reaction", new_callable=AsyncMock) as mock_rm, \
-             patch.object(adapter, "_add_reaction", new_callable=AsyncMock) as mock_add:
-            await adapter._finalize_reaction("unknown-msg", SendResult(success=True))
-
-        mock_rm.assert_not_awaited()
-        mock_add.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_noop_when_msg_id_is_none(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter, SendResult
-        adapter = self._make_adapter()
-
-        with patch.object(adapter, "_remove_reaction", new_callable=AsyncMock) as mock_rm, \
-             patch.object(adapter, "_add_reaction", new_callable=AsyncMock) as mock_add:
-            await adapter._finalize_reaction(None, SendResult(success=True))
-
-        mock_rm.assert_not_awaited()
-        mock_add.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_noop_when_reactions_disabled(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter, SendResult
-        adapter = self._make_adapter(ack="none")
-        adapter._pending_reactions["msg-1"] = "cid-chat"
-
-        with patch.object(adapter, "_remove_reaction", new_callable=AsyncMock) as mock_rm, \
-             patch.object(adapter, "_add_reaction", new_callable=AsyncMock) as mock_add:
-            await adapter._finalize_reaction("msg-1", SendResult(success=True))
-
-        mock_rm.assert_not_awaited()
-        mock_add.assert_not_awaited()
-        assert "msg-1" in adapter._pending_reactions
-
 
 class TestReactionAckConfig:
     """Tests for the ack_reaction config option."""
@@ -2267,7 +2156,7 @@ class TestReactionAckConfig:
 
 
 class TestReactionIntegration:
-    """Integration tests: _on_message adds reaction; send() finalizes it."""
+    """Integration tests: _on_message adds a persistent ACK reaction (add-and-leave)."""
 
     def _make_msg(self, msg_id="msg-int-1", text="hello"):
         msg = MagicMock()
@@ -2296,7 +2185,8 @@ class TestReactionIntegration:
         return adapter
 
     @pytest.mark.asyncio
-    async def test_on_message_adds_pending_reaction(self):
+    async def test_on_message_adds_reaction(self):
+        """_on_message should add a persistent ACK reaction for each inbound message."""
         adapter = self._make_adapter()
         adapter.set_message_handler(AsyncMock())
 
@@ -2304,10 +2194,10 @@ class TestReactionIntegration:
             await adapter._on_message(self._make_msg("msg-int-1"))
 
         mock_add.assert_awaited_once_with("msg-int-1", "cidGROUP1")
-        assert "msg-int-1" in adapter._pending_reactions
 
     @pytest.mark.asyncio
     async def test_on_message_skips_reaction_when_disabled(self):
+        """_on_message should not add a reaction when ack_reaction=none."""
         adapter = self._make_adapter(ack="none")
         adapter.set_message_handler(AsyncMock())
 
@@ -2315,174 +2205,3 @@ class TestReactionIntegration:
             await adapter._on_message(self._make_msg("msg-int-2"))
 
         mock_add.assert_not_awaited()
-        assert "msg-int-2" not in adapter._pending_reactions
-
-    @pytest.mark.asyncio
-    async def test_send_finalizes_reaction_on_success(self):
-        import time, gateway.platforms.dingtalk as mod
-        mod._TOKEN_CACHE["bot-id"] = ("tok", time.time() + 3600)
-
-        adapter = self._make_adapter()
-        adapter._pending_reactions["msg-int-3"] = "cidGROUP1"
-        ok = MagicMock()
-        ok.status_code = 200
-        ok.text = ""
-        adapter._http_client.post = AsyncMock(return_value=ok)
-
-        with patch.object(adapter, "_finalize_reaction", new_callable=AsyncMock) as mock_fin:
-            await adapter.send("cidGROUP1", "response",
-                               reply_to="msg-int-3",
-                               metadata={"session_webhook": "https://wh.example/hook"})
-
-        mock_fin.assert_awaited_once()
-        call_args = mock_fin.call_args[0]
-        assert call_args[0] == "msg-int-3"
-        assert call_args[1].success is True
-        mod._TOKEN_CACHE.pop("bot-id", None)
-
-    @pytest.mark.asyncio
-    async def test_send_finalizes_reaction_on_failure(self):
-        import time, gateway.platforms.dingtalk as mod
-        mod._TOKEN_CACHE["bot-id"] = ("tok", time.time() + 3600)
-
-        adapter = self._make_adapter()
-        adapter._pending_reactions["msg-int-4"] = "cidGROUP1"
-        err = MagicMock()
-        err.status_code = 500
-        err.text = "Server Error"
-        adapter._http_client.post = AsyncMock(return_value=err)
-
-        with patch.object(adapter, "_finalize_reaction", new_callable=AsyncMock) as mock_fin:
-            await adapter.send("cidGROUP1", "response",
-                               reply_to="msg-int-4",
-                               metadata={"session_webhook": "https://wh.example/hook"})
-
-        mock_fin.assert_awaited_once()
-        call_args = mock_fin.call_args[0]
-        assert call_args[1].success is False
-        mod._TOKEN_CACHE.pop("bot-id", None)
-
-    @pytest.mark.asyncio
-    async def test_disconnect_clears_pending_reactions(self):
-        adapter = self._make_adapter()
-        adapter._pending_reactions["msg-x"] = "cid-x"
-        adapter._stream_task = None
-
-        await adapter.disconnect()
-
-        assert len(adapter._pending_reactions) == 0
-
-    # ------------------------------------------------------------------
-    # Bug #7563: media send methods must finalize the ack_reaction
-    # These tests are expected to FAIL before the fix is applied.
-    # ------------------------------------------------------------------
-
-    def _ok_upload_resp(self, media_id="media-1"):
-        r = MagicMock()
-        r.status_code = 200
-        r.json.return_value = {"errcode": 0, "media_id": media_id}
-        r.text = ""
-        return r
-
-    def _ok_send_resp(self):
-        r = MagicMock()
-        r.status_code = 200
-        r.text = '{"errcode": 0, "errmsg": "ok"}'
-        r.json.return_value = {"errcode": 0, "errmsg": "ok"}
-        return r
-
-    @pytest.mark.asyncio
-    async def test_send_image_file_finalizes_reaction(self, tmp_path):
-        """Bug #7563: send_image_file must call _finalize_reaction when reply_to is set."""
-        import time, gateway.platforms.dingtalk as mod
-        mod._TOKEN_CACHE["bot-id"] = ("tok", time.time() + 3600)
-
-        img = tmp_path / "photo.jpg"
-        img.write_bytes(b"\xff\xd8\xff" + b"x" * 100)
-
-        adapter = self._make_adapter()
-        adapter._pending_reactions["msg-media-1"] = "cidGROUP1"
-        adapter._http_client.post = AsyncMock(
-            side_effect=[self._ok_upload_resp(), self._ok_send_resp()]
-        )
-
-        with patch.object(adapter, "_finalize_reaction", new_callable=AsyncMock) as mock_fin:
-            await adapter.send_image_file(
-                "cidGROUP1", str(img), reply_to="msg-media-1"
-            )
-
-        mock_fin.assert_awaited_once()
-        assert mock_fin.call_args[0][0] == "msg-media-1"
-        mod._TOKEN_CACHE.pop("bot-id", None)
-
-    @pytest.mark.asyncio
-    async def test_send_voice_finalizes_reaction(self, tmp_path):
-        """Bug #7563: send_voice must call _finalize_reaction when reply_to is set."""
-        import time, gateway.platforms.dingtalk as mod
-        mod._TOKEN_CACHE["bot-id"] = ("tok", time.time() + 3600)
-
-        audio = tmp_path / "voice.amr"
-        audio.write_bytes(b"#!AMR\n" + b"\x00" * 50)
-
-        adapter = self._make_adapter()
-        adapter._pending_reactions["msg-media-2"] = "cidGROUP1"
-        adapter._http_client.post = AsyncMock(
-            side_effect=[self._ok_upload_resp(), self._ok_send_resp()]
-        )
-
-        with patch.object(adapter, "_finalize_reaction", new_callable=AsyncMock) as mock_fin:
-            await adapter.send_voice(
-                "cidGROUP1", str(audio), reply_to="msg-media-2"
-            )
-
-        mock_fin.assert_awaited_once()
-        assert mock_fin.call_args[0][0] == "msg-media-2"
-        mod._TOKEN_CACHE.pop("bot-id", None)
-
-    @pytest.mark.asyncio
-    async def test_send_document_finalizes_reaction(self, tmp_path):
-        """Bug #7563: send_document must call _finalize_reaction when reply_to is set."""
-        import time, gateway.platforms.dingtalk as mod
-        mod._TOKEN_CACHE["bot-id"] = ("tok", time.time() + 3600)
-
-        doc = tmp_path / "report.pdf"
-        doc.write_bytes(b"%PDF-1.4 content")
-
-        adapter = self._make_adapter()
-        adapter._pending_reactions["msg-media-3"] = "cidGROUP1"
-        adapter._http_client.post = AsyncMock(
-            side_effect=[self._ok_upload_resp(), self._ok_send_resp()]
-        )
-
-        with patch.object(adapter, "_finalize_reaction", new_callable=AsyncMock) as mock_fin:
-            await adapter.send_document(
-                "cidGROUP1", str(doc), reply_to="msg-media-3"
-            )
-
-        mock_fin.assert_awaited_once()
-        assert mock_fin.call_args[0][0] == "msg-media-3"
-        mod._TOKEN_CACHE.pop("bot-id", None)
-
-    @pytest.mark.asyncio
-    async def test_send_video_finalizes_reaction(self, tmp_path):
-        """Bug #7563: send_video must call _finalize_reaction when reply_to is set."""
-        import time, gateway.platforms.dingtalk as mod
-        mod._TOKEN_CACHE["bot-id"] = ("tok", time.time() + 3600)
-
-        video = tmp_path / "clip.mp4"
-        video.write_bytes(b"\x00\x00\x00\x18ftyp" + b"x" * 100)
-
-        adapter = self._make_adapter()
-        adapter._pending_reactions["msg-media-4"] = "cidGROUP1"
-        adapter._http_client.post = AsyncMock(
-            side_effect=[self._ok_upload_resp(), self._ok_send_resp()]
-        )
-
-        with patch.object(adapter, "_finalize_reaction", new_callable=AsyncMock) as mock_fin:
-            await adapter.send_video(
-                "cidGROUP1", str(video), reply_to="msg-media-4"
-            )
-
-        mock_fin.assert_awaited_once()
-        assert mock_fin.call_args[0][0] == "msg-media-4"
-        mod._TOKEN_CACHE.pop("bot-id", None)
