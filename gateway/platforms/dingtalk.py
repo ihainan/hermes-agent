@@ -245,11 +245,29 @@ class DingTalkAdapter(BasePlatformAdapter):
         self._running = False
         self._mark_disconnected()
 
+        # Close the WebSocket explicitly *before* cancelling the task.
+        #
+        # The dingtalk-stream SDK catches CancelledError in its internal while-True
+        # loop and swallows it (does not re-raise), so task.cancel() alone is
+        # unreliable: the SDK wakes up 10 s later and tries to reconnect, creating
+        # a zombie connection.  Closing the WebSocket directly sends a proper WS
+        # close frame to DingTalk (which immediately stops message routing to this
+        # connection) and raises ConnectionClosedOK inside the SDK's `async for` —
+        # that exception is NOT caught by the SDK's except clause, so start() exits
+        # cleanly and our _stream_loop detects self._running == False and returns.
+        if self._stream_client is not None:
+            ws = getattr(self._stream_client, "websocket", None)
+            if ws is not None:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+
         if self._stream_task:
             self._stream_task.cancel()
             try:
                 await self._stream_task
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, Exception):
                 pass
             self._stream_task = None
 
