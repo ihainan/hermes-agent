@@ -245,16 +245,21 @@ class DingTalkAdapter(BasePlatformAdapter):
         self._running = False
         self._mark_disconnected()
 
-        # Close the WebSocket explicitly *before* cancelling the task.
+        # The dingtalk-stream SDK catches CancelledError without re-raising it,
+        # then calls `await asyncio.sleep(10)` before attempting to reconnect.
+        # A single task.cancel() is therefore insufficient: the cancel is consumed
+        # by the SDK's except clause, and the sleep(10) runs uninterrupted.
         #
-        # The dingtalk-stream SDK catches CancelledError in its internal while-True
-        # loop and swallows it (does not re-raise), so task.cancel() alone is
-        # unreliable: the SDK wakes up 10 s later and tries to reconnect, creating
-        # a zombie connection.  Closing the WebSocket directly sends a proper WS
-        # close frame to DingTalk (which immediately stops message routing to this
-        # connection) and raises ConnectionClosedOK inside the SDK's `async for` —
-        # that exception is NOT caught by the SDK's except clause, so start() exits
-        # cleanly and our _stream_loop detects self._running == False and returns.
+        # Fix:
+        #   1. Explicitly close the WebSocket — sends a proper WS close frame to
+        #      DingTalk so it immediately stops routing messages to this connection.
+        #   2. First cancel — interrupts the SDK's current await point (async for /
+        #      recv), raising CancelledError which the SDK catches and enters sleep.
+        #   3. Brief sleep — yields to the event loop so the SDK actually processes
+        #      the first cancel and reaches asyncio.sleep(10).
+        #   4. Second cancel — interrupts sleep(10); this CancelledError propagates
+        #      out of the SDK's except block, through start(), and our _stream_loop
+        #      catches it with `except asyncio.CancelledError: return`.
         if self._stream_client is not None:
             ws = getattr(self._stream_client, "websocket", None)
             if ws is not None:
@@ -264,7 +269,9 @@ class DingTalkAdapter(BasePlatformAdapter):
                     pass
 
         if self._stream_task:
-            self._stream_task.cancel()
+            self._stream_task.cancel()                      # first cancel
+            await asyncio.sleep(0.2)                        # let SDK reach sleep(10)
+            self._stream_task.cancel()                      # second cancel, breaks sleep(10)
             try:
                 await self._stream_task
             except (asyncio.CancelledError, Exception):
