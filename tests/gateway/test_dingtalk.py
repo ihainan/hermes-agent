@@ -2368,3 +2368,117 @@ class TestReactionIntegration:
         await adapter.disconnect()
 
         assert len(adapter._pending_reactions) == 0
+
+    # ------------------------------------------------------------------
+    # Bug #7563: media send methods must finalize the ack_reaction
+    # These tests are expected to FAIL before the fix is applied.
+    # ------------------------------------------------------------------
+
+    def _ok_upload_resp(self, media_id="media-1"):
+        r = MagicMock()
+        r.status_code = 200
+        r.json.return_value = {"mediaId": media_id}
+        r.text = ""
+        return r
+
+    def _ok_send_resp(self):
+        r = MagicMock()
+        r.status_code = 200
+        r.text = ""
+        return r
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_finalizes_reaction(self, tmp_path):
+        """Bug #7563: send_image_file must call _finalize_reaction when reply_to is set."""
+        import time, gateway.platforms.dingtalk as mod
+        mod._TOKEN_CACHE["bot-id"] = ("tok", time.time() + 3600)
+
+        img = tmp_path / "photo.jpg"
+        img.write_bytes(b"\xff\xd8\xff" + b"x" * 100)
+
+        adapter = self._make_adapter()
+        adapter._pending_reactions["msg-media-1"] = "cidGROUP1"
+        adapter._http_client.post = AsyncMock(
+            side_effect=[self._ok_upload_resp(), self._ok_send_resp()]
+        )
+
+        with patch.object(adapter, "_finalize_reaction", new_callable=AsyncMock) as mock_fin:
+            await adapter.send_image_file(
+                "cidGROUP1", str(img), reply_to="msg-media-1"
+            )
+
+        mock_fin.assert_awaited_once()
+        assert mock_fin.call_args[0][0] == "msg-media-1"
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_send_voice_finalizes_reaction(self, tmp_path):
+        """Bug #7563: send_voice must call _finalize_reaction when reply_to is set."""
+        import time, gateway.platforms.dingtalk as mod
+        mod._TOKEN_CACHE["bot-id"] = ("tok", time.time() + 3600)
+
+        audio = tmp_path / "voice.amr"
+        audio.write_bytes(b"#!AMR\n" + b"\x00" * 50)
+
+        adapter = self._make_adapter()
+        adapter._pending_reactions["msg-media-2"] = "cidGROUP1"
+        adapter._http_client.post = AsyncMock(
+            side_effect=[self._ok_upload_resp(), self._ok_send_resp()]
+        )
+
+        with patch.object(adapter, "_finalize_reaction", new_callable=AsyncMock) as mock_fin:
+            await adapter.send_voice(
+                "cidGROUP1", str(audio), reply_to="msg-media-2"
+            )
+
+        mock_fin.assert_awaited_once()
+        assert mock_fin.call_args[0][0] == "msg-media-2"
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_send_document_finalizes_reaction(self, tmp_path):
+        """Bug #7563: send_document must call _finalize_reaction when reply_to is set."""
+        import time, gateway.platforms.dingtalk as mod
+        mod._TOKEN_CACHE["bot-id"] = ("tok", time.time() + 3600)
+
+        doc = tmp_path / "report.pdf"
+        doc.write_bytes(b"%PDF-1.4 content")
+
+        adapter = self._make_adapter()
+        adapter._pending_reactions["msg-media-3"] = "cidGROUP1"
+        adapter._http_client.post = AsyncMock(
+            side_effect=[self._ok_upload_resp(), self._ok_send_resp()]
+        )
+
+        with patch.object(adapter, "_finalize_reaction", new_callable=AsyncMock) as mock_fin:
+            await adapter.send_document(
+                "cidGROUP1", str(doc), reply_to="msg-media-3"
+            )
+
+        mock_fin.assert_awaited_once()
+        assert mock_fin.call_args[0][0] == "msg-media-3"
+        mod._TOKEN_CACHE.pop("bot-id", None)
+
+    @pytest.mark.asyncio
+    async def test_send_video_finalizes_reaction(self, tmp_path):
+        """Bug #7563: send_video must call _finalize_reaction when reply_to is set."""
+        import time, gateway.platforms.dingtalk as mod
+        mod._TOKEN_CACHE["bot-id"] = ("tok", time.time() + 3600)
+
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"\x00\x00\x00\x18ftyp" + b"x" * 100)
+
+        adapter = self._make_adapter()
+        adapter._pending_reactions["msg-media-4"] = "cidGROUP1"
+        adapter._http_client.post = AsyncMock(
+            side_effect=[self._ok_upload_resp(), self._ok_send_resp()]
+        )
+
+        with patch.object(adapter, "_finalize_reaction", new_callable=AsyncMock) as mock_fin:
+            await adapter.send_video(
+                "cidGROUP1", str(video), reply_to="msg-media-4"
+            )
+
+        mock_fin.assert_awaited_once()
+        assert mock_fin.call_args[0][0] == "msg-media-4"
+        mod._TOKEN_CACHE.pop("bot-id", None)

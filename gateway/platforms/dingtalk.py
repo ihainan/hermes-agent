@@ -69,6 +69,11 @@ RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 MAX_RECONNECT_ATTEMPTS = 10
 RECONNECT_JITTER_FACTOR = 0.2       # ±20% jitter applied to backoff delays
 
+# DingTalk routing confusion window after ungraceful shutdown (kill -9).
+# When a process dies without sending a WebSocket close frame, DingTalk continues
+# routing messages to the dead connection for up to this many seconds.
+_ROUTING_WINDOW_SECS = 90
+
 # OAuth token management
 _DINGTALK_API_BASE = "https://api.dingtalk.com/v1.0"
 _TOKEN_REFRESH_BUFFER = 60      # seconds before expiry to proactively refresh
@@ -245,22 +250,27 @@ class DingTalkAdapter(BasePlatformAdapter):
         self._running = False
         self._mark_disconnected()
 
-        # The dingtalk-stream SDK catches CancelledError without re-raising it,
-        # then calls `await asyncio.sleep(10)` before attempting to reconnect.
-        # A single task.cancel() is therefore insufficient: the cancel is consumed
-        # by the SDK's except clause, and the sleep(10) runs uninterrupted.
+        # The SDK's start() is a while-True loop. When we close the WebSocket, the
+        # async-for loop ends cleanly (no exception) and the SDK immediately calls
+        # open_connection() — a synchronous HTTP call that obtains a new ticket from
+        # DingTalk before any cancel() can fire. This creates a ghost connection that
+        # confuses DingTalk routing for up to ~60s.
         #
         # Fix:
-        #   1. Explicitly close the WebSocket — sends a proper WS close frame to
-        #      DingTalk so it immediately stops routing messages to this connection.
-        #   2. First cancel — interrupts the SDK's current await point (async for /
-        #      recv), raising CancelledError which the SDK catches and enters sleep.
-        #   3. Brief sleep — yields to the event loop so the SDK actually processes
-        #      the first cancel and reaches asyncio.sleep(10).
-        #   4. Second cancel — interrupts sleep(10); this CancelledError propagates
-        #      out of the SDK's except block, through start(), and our _stream_loop
-        #      catches it with `except asyncio.CancelledError: return`.
+        #   1. Patch open_connection() to raise KeyboardInterrupt (the SDK's own
+        #      break condition) when _running is False. This prevents any new HTTP
+        #      call to DingTalk and causes start() to exit cleanly via its
+        #      `except KeyboardInterrupt: break` path — no ghost ticket is issued.
+        #   2. Close the WebSocket — sends a proper WS close frame so DingTalk
+        #      switches routing immediately (vs. ~30-60s TCP timeout after kill -9).
+        #   3. Single cancel — handles the case where the SDK is sleeping between
+        #      reconnect attempts (asyncio.sleep(10)); CancelledError propagates
+        #      out of the except handler and out of start() cleanly.
         if self._stream_client is not None:
+            def _no_reconnect():
+                raise KeyboardInterrupt("adapter shutting down")
+            self._stream_client.open_connection = _no_reconnect  # type: ignore[method-assign]
+
             ws = getattr(self._stream_client, "websocket", None)
             if ws is not None:
                 try:
@@ -269,9 +279,7 @@ class DingTalkAdapter(BasePlatformAdapter):
                     pass
 
         if self._stream_task:
-            self._stream_task.cancel()                      # first cancel
-            await asyncio.sleep(0.2)                        # let SDK reach sleep(10)
-            self._stream_task.cancel()                      # second cancel, breaks sleep(10)
+            self._stream_task.cancel()
             try:
                 await self._stream_task
             except (asyncio.CancelledError, Exception):
@@ -851,6 +859,52 @@ class DingTalkAdapter(BasePlatformAdapter):
 
     # -- Outbound media ---------------------------------------------------------
 
+    async def _send_media_via_webhook(
+        self,
+        chat_id: str,
+        msgtype: str,
+        media_dict: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[SendResult]:
+        """Try to send a media message via session webhook.
+
+        Returns a SendResult on success or definitive failure, or None if no
+        session webhook is available (caller should fall back to proactive API).
+
+        DingTalk session webhook supports native media types:
+            image: { "msgtype": "image", "image": { "media_id": "..." } }
+            voice: { "msgtype": "voice", "voice": { "media_id": "...", "duration": "5" } }
+            file:  { "msgtype": "file",  "file":  { "media_id": "..." } }
+            video: { "msgtype": "video", "video": { "media_id": "..." } }
+        """
+        metadata = metadata or {}
+        session_webhook = metadata.get("session_webhook") or self._session_webhooks.get(chat_id)
+        if not session_webhook:
+            return None
+        if not self._http_client:
+            return None
+
+        payload = {"msgtype": msgtype, msgtype: media_dict}
+        try:
+            headers = await self._dingtalk_headers()
+            resp = await self._http_client.post(
+                session_webhook, json=payload, headers=headers, timeout=15.0
+            )
+            if resp.status_code < 300:
+                logger.debug("[%s] Media sent via session_webhook (type=%s)", self.name, msgtype)
+                return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
+            body = resp.text
+            logger.warning(
+                "[%s] session_webhook media send failed HTTP %d: %s",
+                self.name, resp.status_code, body[:200],
+            )
+            return SendResult(success=False, error=f"HTTP {resp.status_code}: {body[:200]}")
+        except Exception as e:
+            logger.warning(
+                "[%s] session_webhook media send error (%s), will try proactive API", self.name, e
+            )
+            return None
+
     async def send_image(
         self,
         chat_id: str,
@@ -887,11 +941,49 @@ class DingTalkAdapter(BasePlatformAdapter):
         if not media_id:
             return await self.send(chat_id, f"[Image]({image_url})" + (f"\n{caption}" if caption else ""))
 
-        # Send via sampleImageMsg using the uploaded mediaId.
-        result = await self._send_media_proactive(chat_id, "sampleImageMsg", {"photoURL": media_id})
-        # If there is a caption, send it as a follow-up markdown message.
+        # Prefer session webhook; fall back to proactive API.
+        result = await self._send_media_via_webhook(
+            chat_id, "image", {"media_id": media_id}, metadata
+        ) or await self._send_media_proactive(chat_id, "sampleImageMsg", {"photoURL": media_id})
         if caption and result.success:
             await self.send(chat_id, caption, reply_to=reply_to, metadata=metadata)
+        return result
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a local image file to a DingTalk chat.
+
+        Reads the file, uploads to DingTalk media API, then sends via sampleImageMsg.
+        Falls back to a text message with the filename on failure.
+        """
+        try:
+            with open(image_path, "rb") as f:
+                image_bytes = f.read()
+        except OSError as e:
+            return SendResult(success=False, error=f"Cannot read image file: {e}")
+
+        filename = os.path.basename(image_path) or "image.jpg"
+        media_id = await self._upload_media(image_bytes, "image", filename)
+        if not media_id:
+            return await self.send(
+                chat_id,
+                f"🖼️ {caption or filename}",
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+
+        result = await self._send_media_via_webhook(
+            chat_id, "image", {"media_id": media_id}, metadata
+        ) or await self._send_media_proactive(chat_id, "sampleImageMsg", {"photoURL": media_id})
+        if caption and result.success:
+            await self.send(chat_id, caption, reply_to=reply_to, metadata=metadata)
+        await self._finalize_reaction(reply_to, result)
         return result
 
     async def send_voice(
@@ -900,11 +992,12 @@ class DingTalkAdapter(BasePlatformAdapter):
         audio_path: str,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
         """Send an audio/voice message to a DingTalk chat.
 
-        Uploads the file and sends via sampleAudio template.
+        Uploads the file and sends via session webhook (preferred) or sampleAudio.
         Duration is parsed via mutagen when available; falls back to 0.
         See issue #9 for tracking accurate duration without mutagen.
         """
@@ -920,10 +1013,16 @@ class DingTalkAdapter(BasePlatformAdapter):
             return await self.send(chat_id, f"🔊 Audio: {audio_path}" + (f"\n{caption}" if caption else ""))
 
         duration_ms = self._get_audio_duration_ms(audio_path)
-        return await self._send_media_proactive(
+        result = await self._send_media_via_webhook(
+            chat_id, "voice",
+            {"media_id": media_id, "duration": str(duration_ms)},
+            metadata,
+        ) or await self._send_media_proactive(
             chat_id, "sampleAudio",
             {"mediaId": media_id, "duration": str(duration_ms)},
         )
+        await self._finalize_reaction(reply_to, result)
+        return result
 
     async def send_document(
         self,
@@ -932,9 +1031,13 @@ class DingTalkAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         file_name: Optional[str] = None,
         reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
-        """Send a document/file to a DingTalk chat via sampleFile template."""
+        """Send a document/file to a DingTalk chat.
+
+        Prefers session webhook (msgtype=file); falls back to sampleFile proactive.
+        """
         try:
             with open(file_path, "rb") as f:
                 file_bytes = f.read()
@@ -947,10 +1050,14 @@ class DingTalkAdapter(BasePlatformAdapter):
             return await self.send(chat_id, f"📎 File: {file_path}" + (f"\n{caption}" if caption else ""))
 
         file_type = os.path.splitext(filename)[1].lstrip(".") or "bin"
-        return await self._send_media_proactive(
+        result = await self._send_media_via_webhook(
+            chat_id, "file", {"media_id": media_id}, metadata,
+        ) or await self._send_media_proactive(
             chat_id, "sampleFile",
             {"mediaId": media_id, "fileName": filename, "fileType": file_type},
         )
+        await self._finalize_reaction(reply_to, result)
+        return result
 
     async def send_video(
         self,
@@ -958,13 +1065,13 @@ class DingTalkAdapter(BasePlatformAdapter):
         video_path: str,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
         """Send a video to a DingTalk chat.
 
-        Uses sampleFile template instead of sampleVideo because sampleVideo
-        requires a valid thumbnail mediaId (picMediaId); passing an empty string
-        causes an API error and there is no server-side thumbnail generation.
+        Prefers session webhook (msgtype=video); falls back to sampleFile proactive
+        because sampleVideo requires a thumbnail mediaId that we cannot generate.
         """
         try:
             with open(video_path, "rb") as f:
@@ -977,15 +1084,16 @@ class DingTalkAdapter(BasePlatformAdapter):
         if not media_id:
             return await self.send(chat_id, f"🎬 Video: {video_path}" + (f"\n{caption}" if caption else ""))
 
-        # sampleVideo requires a valid picMediaId (thumbnail); passing an empty string
-        # causes an API error. Fall back to sampleFile which works without a thumbnail.
         file_ext = os.path.splitext(filename)[1].lstrip(".").lower() or "mp4"
-        result = await self._send_media_proactive(
+        result = await self._send_media_via_webhook(
+            chat_id, "video", {"media_id": media_id}, metadata,
+        ) or await self._send_media_proactive(
             chat_id, "sampleFile",
             {"mediaId": media_id, "fileName": filename, "fileType": file_ext},
         )
         if caption and result.success:
-            await self.send(chat_id, caption, reply_to=reply_to)
+            await self.send(chat_id, caption, reply_to=reply_to, metadata=metadata)
+        await self._finalize_reaction(reply_to, result)
         return result
 
     async def _upload_media(
