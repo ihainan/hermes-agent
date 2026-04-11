@@ -465,6 +465,10 @@ class DingTalkAdapter(BasePlatformAdapter):
                 if path:
                     media_urls.append(path)
                     media_types.append(mime)
+            # Keep DOCUMENT type even for image files: the _enrich_message_with_vision
+            # pre-processing path is fragile with some vision providers; the agent's
+            # manual mcp_vision_analyze tool call is more reliable.  _download_media
+            # already caches images in cache/images/ by extension so the path is usable.
             return file_name, MessageType.DOCUMENT, media_urls, media_types
 
         if msgtype == "richText":
@@ -558,12 +562,23 @@ class DingTalkAdapter(BasePlatformAdapter):
             file_bytes = file_resp.content
             content_type = file_resp.headers.get("content-type", default_mime).split(";")[0].strip()
 
-            # Choose cache helper based on MIME type
+            # DingTalk file messages often return application/octet-stream regardless of
+            # actual type. Fall back to sniffing by filename extension.
+            _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff"}
+            _AUDIO_EXTS = {".amr", ".mp3", ".wav", ".ogg", ".opus", ".m4a"}
+            _file_ext = os.path.splitext(filename or "")[1].lower()
+            if content_type == "application/octet-stream":
+                if _file_ext in _IMAGE_EXTS:
+                    content_type = "image/" + (_file_ext.lstrip(".") or "jpeg")
+                elif _file_ext in _AUDIO_EXTS:
+                    content_type = "audio/" + (_file_ext.lstrip(".") or "amr")
+
+            # Choose cache helper based on resolved MIME type
             if content_type.startswith("image/"):
-                ext = default_ext or ("." + content_type.split("/")[-1]) or ".jpg"
+                ext = default_ext or _file_ext or ("." + content_type.split("/")[-1]) or ".jpg"
                 path = cache_image_from_bytes(file_bytes, ext)
             elif content_type.startswith("audio/"):
-                ext = default_ext or ("." + content_type.split("/")[-1]) or ".amr"
+                ext = default_ext or _file_ext or ("." + content_type.split("/")[-1]) or ".amr"
                 path = cache_audio_from_bytes(file_bytes, ext)
             else:
                 safe_name = filename or f"media{default_ext or ''}"
