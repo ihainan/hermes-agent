@@ -150,6 +150,12 @@ class DingTalkAdapter(BasePlatformAdapter):
         }
         # Track in-flight reactions: msg_id → chat_id
         self._pending_reactions: Dict[str, str] = {}
+        # Reverse mapping for fallback cleanup when msg_id is unavailable (e.g. queued messages)
+        self._chat_pending_msg_ids: Dict[str, List[str]] = {}
+        # Messages dequeued by get_pending_message() but not yet responded to.
+        # When run.py pops a queued message without a matching send(reply_to=msg_id),
+        # we collect the msg_ids here and clean their reactions on the next send.
+        self._dequeued_reactions: Dict[str, List[str]] = {}  # chat_id → [msg_ids]
 
     # -- Connection lifecycle -----------------------------------------------
 
@@ -308,8 +314,9 @@ class DingTalkAdapter(BasePlatformAdapter):
         """Process an incoming DingTalk chatbot message."""
         self._last_message_at = time.monotonic()
         msg_id = getattr(message, "message_id", None) or uuid.uuid4().hex
+        logger.info("[%s] _on_message received: msg_id=%s", self.name, msg_id)
         if self._is_duplicate(msg_id):
-            logger.debug("[%s] Duplicate message %s, skipping", self.name, msg_id)
+            logger.info("[%s] _on_message duplicate, skipping: msg_id=%s", self.name, msg_id)
             return
 
         # Parse message content (text + media) based on msgtype
@@ -394,6 +401,9 @@ class DingTalkAdapter(BasePlatformAdapter):
         if self._ack_reaction_enabled and chat_id:
             await self._add_reaction(msg_id, chat_id)
             self._pending_reactions[msg_id] = chat_id
+            self._chat_pending_msg_ids.setdefault(chat_id, []).append(msg_id)
+            logger.info("[%s] reaction added: msg_id=%s pending=%s",
+                        self.name, msg_id, list(self._pending_reactions.keys()))
 
         await self.handle_message(event)
 
@@ -779,7 +789,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("[%s] Token error before session_webhook send, falling back to proactive: %s", self.name, e)
                 result = await self._send_proactive(chat_id, content)
-                await self._finalize_reaction(reply_to, result)
+                await self._finalize_reaction(reply_to, result, chat_id)
                 return result
 
             _session_result: Optional[SendResult] = None
@@ -806,7 +816,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             logger.debug("[%s] No session_webhook for %s, using proactive API", self.name, chat_id[:20])
             result = await self._send_proactive(chat_id, content)
 
-        await self._finalize_reaction(reply_to, result)
+        await self._finalize_reaction(reply_to, result, chat_id)
         return result
 
     async def _send_proactive(self, chat_id: str, content: str) -> SendResult:
@@ -1014,7 +1024,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         ) or await self._send_media_proactive(chat_id, "sampleImageMsg", {"photoURL": media_id})
         if caption and result.success:
             await self.send(chat_id, caption, reply_to=reply_to, metadata=metadata)
-        await self._finalize_reaction(reply_to, result)
+        await self._finalize_reaction(reply_to, result, chat_id)
         return result
 
     async def send_voice(
@@ -1053,7 +1063,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             chat_id, "sampleAudio",
             {"mediaId": media_id, "duration": str(duration_ms)},
         )
-        await self._finalize_reaction(reply_to, result)
+        await self._finalize_reaction(reply_to, result, chat_id)
         return result
 
     async def send_document(
@@ -1091,7 +1101,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             chat_id, "sampleFile",
             {"mediaId": media_id, "fileName": filename, "fileType": file_type},
         )
-        await self._finalize_reaction(reply_to, result)
+        await self._finalize_reaction(reply_to, result, chat_id)
         return result
 
     async def send_video(
@@ -1131,7 +1141,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         )
         if caption and result.success:
             await self.send(chat_id, caption, reply_to=reply_to, metadata=metadata)
-        await self._finalize_reaction(reply_to, result)
+        await self._finalize_reaction(reply_to, result, chat_id)
         return result
 
     async def _upload_media(
@@ -1341,20 +1351,82 @@ class DingTalkAdapter(BasePlatformAdapter):
                 logger.warning("[%s] _remove_reaction failed (non-fatal, attempt %d): %s", self.name, i + 1, e)
                 return
 
-    async def _finalize_reaction(self, msg_id: Optional[str], result: SendResult) -> None:
+    async def _finalize_reaction(
+        self, msg_id: Optional[str], result: SendResult, chat_id: Optional[str] = None
+    ) -> None:
         """Recall the pending "thinking" reaction after a send completes.
 
         The native DingTalk reaction flow only supports attach-then-recall.
         We always recall regardless of send success/failure.
+
+        When msg_id is known (normal path), look it up directly in _pending_reactions.
+        When msg_id is None (queued message path — run.py loses the id after dequeue),
+        fall back to the oldest pending reaction for the given chat_id so that the
+        reaction is never left orphaned.
         """
-        if not self._ack_reaction_enabled or not msg_id:
-            logger.debug("[%s] _finalize_reaction skipped: enabled=%s msg_id=%r", self.name, self._ack_reaction_enabled, msg_id)
+        if not self._ack_reaction_enabled:
+            logger.debug("[%s] _finalize_reaction skipped: enabled=%s", self.name, self._ack_reaction_enabled)
             return
-        chat_id = self._pending_reactions.pop(msg_id, None)
-        logger.debug("[%s] _finalize_reaction: msg_id=%r chat_id=%r pending_keys=%s", self.name, msg_id, chat_id, list(self._pending_reactions.keys())[:5])
-        if not chat_id:
-            return
-        await self._remove_reaction(msg_id, chat_id)
+
+        logger.info("[%s] _finalize_reaction called: msg_id=%r chat_id=%r pending=%s chat_queue=%s",
+                    self.name, msg_id, chat_id,
+                    list(self._pending_reactions.keys()),
+                    {k: v for k, v in self._chat_pending_msg_ids.items() if v})
+
+        if msg_id:
+            resolved_chat_id = self._pending_reactions.pop(msg_id, None)
+            if resolved_chat_id:
+                # Normal path: found and consumed the pending reaction.
+                pending = self._chat_pending_msg_ids.get(resolved_chat_id, [])
+                if msg_id in pending:
+                    pending.remove(msg_id)
+                logger.info("[%s] _finalize_reaction normal: removing reaction msg_id=%r", self.name, msg_id)
+                await self._remove_reaction(msg_id, resolved_chat_id)
+            elif chat_id:
+                # msg_id was already consumed by the first_response send (run.py line 7373
+                # sends first_response with reply_to=None, which pops msg_id via fallback
+                # below). This second call carries reply_to=original_msg_id from base.py's
+                # _process_message_background and represents the queued message's response.
+                # Clean up the next oldest pending reaction for this chat.
+                pending = self._chat_pending_msg_ids.get(chat_id, [])
+                if pending:
+                    oldest_msg_id = pending.pop(0)
+                    self._pending_reactions.pop(oldest_msg_id, None)
+                    logger.info("[%s] _finalize_reaction stale-id fallback: removing msg_id=%r", self.name, oldest_msg_id)
+                    await self._remove_reaction(oldest_msg_id, chat_id)
+                else:
+                    logger.info("[%s] _finalize_reaction stale-id fallback: no pending for chat %r", self.name, chat_id)
+        elif chat_id:
+            # reply_to was None.  This fires in two distinct situations:
+            #
+            #   (a) Queued first_response: run.py finishes processing message A and
+            #       sends A's final answer before recursing into queued message C.
+            #       At this point pending = [A, C] — len >= 2.  We should remove A.
+            #
+            #   (b) Ancillary sends: home-channel notice, context-injection errors,
+            #       etc. that fire quickly (< 1s) before the LLM has even started.
+            #       At this point pending = [B] — len == 1.  Removing B here would
+            #       leave the message with no reaction during the entire LLM call.
+            #
+            # Guard: only fire when there are >= 2 pending reactions.  If only one
+            # reaction is pending, this send is almost certainly an ancillary send
+            # rather than the queued first_response (which always has a queued
+            # successor already in the list).
+            pending = self._chat_pending_msg_ids.get(chat_id, [])
+            if not pending:
+                logger.info("[%s] _finalize_reaction None-fallback: no pending for chat %r", self.name, chat_id)
+                return
+            if len(pending) < 2:
+                logger.info(
+                    "[%s] _finalize_reaction None-fallback: skipping — only 1 pending reaction "
+                    "(ancillary send, not queued first_response) chat=%r msg_id=%r",
+                    self.name, chat_id, pending[0],
+                )
+                return
+            oldest_msg_id = pending.pop(0)
+            self._pending_reactions.pop(oldest_msg_id, None)
+            logger.info("[%s] _finalize_reaction None-fallback: removing msg_id=%r", self.name, oldest_msg_id)
+            await self._remove_reaction(oldest_msg_id, chat_id)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """DingTalk does not support typing indicators."""
