@@ -1233,46 +1233,48 @@ class TestBuildMultipart:
 
     def test_returns_bytes_and_boundary(self):
         adapter = self._make_adapter()
-        body, boundary = adapter._build_multipart(b"data", "image", "photo.jpg")
+        body, boundary = adapter._build_multipart(b"data", "photo.jpg")
         assert isinstance(body, bytes)
         assert isinstance(boundary, str)
         assert len(boundary) > 0
 
     def test_boundary_appears_in_body(self):
         adapter = self._make_adapter()
-        body, boundary = adapter._build_multipart(b"data", "image", "photo.jpg")
+        body, boundary = adapter._build_multipart(b"data", "photo.jpg")
         assert boundary.encode() in body
 
-    def test_robot_code_field_present(self):
+    def test_media_field_name_present(self):
+        # oapi endpoint expects a single 'media' field; robotCode/mediaType go in URL.
         adapter = self._make_adapter()
-        body, _ = adapter._build_multipart(b"data", "image", "photo.jpg")
-        assert b"bot-id" in body
+        body, _ = adapter._build_multipart(b"data", "photo.jpg")
+        assert b'name="media"' in body
 
-    def test_media_type_field_present(self):
+    def test_filename_in_content_disposition(self):
+        # filename must appear in Content-Disposition; it is NOT a separate form field.
         adapter = self._make_adapter()
-        body, _ = adapter._build_multipart(b"data", "voice", "audio.amr")
-        assert b"voice" in body
+        body, _ = adapter._build_multipart(b"data", "audio.amr")
+        assert b"audio.amr" in body
 
     def test_filename_field_present(self):
         adapter = self._make_adapter()
-        body, _ = adapter._build_multipart(b"data", "file", "report.pdf")
+        body, _ = adapter._build_multipart(b"data", "report.pdf")
         assert b"report.pdf" in body
 
     def test_binary_data_embedded(self):
         adapter = self._make_adapter()
         payload = b"\x00\x01\x02\x03binary"
-        body, _ = adapter._build_multipart(payload, "image", "img.png")
+        body, _ = adapter._build_multipart(payload, "img.png")
         assert payload in body
 
     def test_body_ends_with_closing_boundary(self):
         adapter = self._make_adapter()
-        body, boundary = adapter._build_multipart(b"x", "image", "x.jpg")
+        body, boundary = adapter._build_multipart(b"x", "x.jpg")
         assert body.endswith(f"--{boundary}--\r\n".encode())
 
     def test_each_call_produces_unique_boundary(self):
         adapter = self._make_adapter()
-        _, b1 = adapter._build_multipart(b"x", "image", "a.jpg")
-        _, b2 = adapter._build_multipart(b"x", "image", "a.jpg")
+        _, b1 = adapter._build_multipart(b"x", "a.jpg")
+        _, b2 = adapter._build_multipart(b"x", "a.jpg")
         assert b1 != b2
 
 
@@ -1290,7 +1292,7 @@ class TestUploadMedia:
     def _ok_upload_resp(self, media_id="media-abc"):
         resp = MagicMock()
         resp.status_code = 200
-        resp.json.return_value = {"mediaId": media_id}
+        resp.json.return_value = {"errcode": 0, "media_id": media_id}
         resp.text = ""
         return resp
 
@@ -1325,7 +1327,7 @@ class TestUploadMedia:
         await adapter._upload_media(b"bytes", "image", "img.jpg")
 
         call_url = adapter._http_client.post.call_args[0][0]
-        assert "robot/messageFiles/upload" in call_url
+        assert "oapi.dingtalk.com/media/upload" in call_url
         mod._TOKEN_CACHE.pop("bot-id", None)
 
     @pytest.mark.asyncio
@@ -1610,7 +1612,7 @@ class TestSendImage:
     def _ok_upload_resp(self, media_id="media-img"):
         resp = MagicMock()
         resp.status_code = 200
-        resp.json.return_value = {"mediaId": media_id}
+        resp.json.return_value = {"errcode": 0, "media_id": media_id}
         resp.text = ""
         return resp
 
@@ -1769,7 +1771,7 @@ class TestSendVoice:
         adapter = self._make_adapter()
         upload_resp = MagicMock()
         upload_resp.status_code = 200
-        upload_resp.json.return_value = {"mediaId": "media-audio-1"}
+        upload_resp.json.return_value = {"errcode": 0, "media_id": "media-audio-1"}
         upload_resp.text = ""
         send_resp = MagicMock()
         send_resp.status_code = 200
@@ -1809,7 +1811,7 @@ class TestSendVoice:
 
         assert result.success is True
         fallback_payload = adapter._http_client.post.call_args[1]["json"]
-        assert "Audio" in fallback_payload["markdown"]["text"]
+        assert "test.amr" in fallback_payload["markdown"]["text"]
         mod._TOKEN_CACHE.pop("bot-id", None)
 
     @pytest.mark.asyncio
@@ -1832,7 +1834,7 @@ class TestSendVoice:
         adapter = self._make_adapter()
         upload_resp = MagicMock()
         upload_resp.status_code = 200
-        upload_resp.json.return_value = {"mediaId": "m-1"}
+        upload_resp.json.return_value = {"errcode": 0, "media_id": "m-1"}
         upload_resp.text = ""
         send_resp = MagicMock()
         send_resp.status_code = 200
@@ -1870,7 +1872,7 @@ class TestSendDocument:
         adapter = self._make_adapter()
         upload_resp = MagicMock()
         upload_resp.status_code = 200
-        upload_resp.json.return_value = {"mediaId": "media-doc-1"}
+        upload_resp.json.return_value = {"errcode": 0, "media_id": "media-doc-1"}
         upload_resp.text = ""
         send_resp = MagicMock()
         send_resp.status_code = 200
@@ -1900,7 +1902,7 @@ class TestSendDocument:
         adapter = self._make_adapter()
         upload_resp = MagicMock()
         upload_resp.status_code = 200
-        upload_resp.json.return_value = {"mediaId": "m-2"}
+        upload_resp.json.return_value = {"errcode": 0, "media_id": "m-2"}
         upload_resp.text = ""
         send_resp = MagicMock()
         send_resp.status_code = 200
@@ -1945,7 +1947,7 @@ class TestSendDocument:
 
         assert result.success is True
         fallback_payload = adapter._http_client.post.call_args[1]["json"]
-        assert "File" in fallback_payload["markdown"]["text"]
+        assert "data.txt" in fallback_payload["markdown"]["text"]
         mod._TOKEN_CACHE.pop("bot-id", None)
 
 
@@ -1972,7 +1974,7 @@ class TestSendVideo:
         adapter = self._make_adapter()
         upload_resp = MagicMock()
         upload_resp.status_code = 200
-        upload_resp.json.return_value = {"mediaId": "media-vid-1"}
+        upload_resp.json.return_value = {"errcode": 0, "media_id": "media-vid-1"}
         upload_resp.text = ""
         send_resp = MagicMock()
         send_resp.status_code = 200
@@ -2004,7 +2006,7 @@ class TestSendVideo:
         adapter = self._make_adapter()
         upload_resp = MagicMock()
         upload_resp.status_code = 200
-        upload_resp.json.return_value = {"mediaId": "m-v"}
+        upload_resp.json.return_value = {"errcode": 0, "media_id": "m-v"}
         upload_resp.text = ""
         send_resp = MagicMock()
         send_resp.status_code = 200
@@ -2050,7 +2052,7 @@ class TestSendVideo:
 
         assert result.success is True
         fallback_payload = adapter._http_client.post.call_args[1]["json"]
-        assert "Video" in fallback_payload["markdown"]["text"]
+        assert "clip.mp4" in fallback_payload["markdown"]["text"]
         mod._TOKEN_CACHE.pop("bot-id", None)
 
 
@@ -2377,7 +2379,7 @@ class TestReactionIntegration:
     def _ok_upload_resp(self, media_id="media-1"):
         r = MagicMock()
         r.status_code = 200
-        r.json.return_value = {"mediaId": media_id}
+        r.json.return_value = {"errcode": 0, "media_id": media_id}
         r.text = ""
         return r
 

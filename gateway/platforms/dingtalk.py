@@ -76,6 +76,9 @@ _ROUTING_WINDOW_SECS = 90
 
 # OAuth token management
 _DINGTALK_API_BASE = "https://api.dingtalk.com/v1.0"
+# Legacy API base (oapi.dingtalk.com) — used for media upload, which is not
+# available on the v1.0 domain. Token is passed as ?access_token= query param.
+_DINGTALK_OAPI_BASE = "https://oapi.dingtalk.com"
 _TOKEN_REFRESH_BUFFER = 60      # seconds before expiry to proactively refresh
 _TOKEN_RETRY_ATTEMPTS = 3
 _TOKEN_RETRY_BASE_DELAY = 0.1   # seconds (100 ms), doubles each retry
@@ -934,12 +937,12 @@ class DingTalkAdapter(BasePlatformAdapter):
             filename = f"image{ext}"
         except Exception as e:
             logger.warning("[%s] send_image: failed to download %s: %s", self.name, image_url[:80], e)
-            return await self.send(chat_id, f"[Image]({image_url})" + (f"\n{caption}" if caption else ""))
+            return await self.send(chat_id, f"[Image]({image_url})" + (f"\n{caption}" if caption else ""), reply_to=reply_to, metadata=metadata)
 
         # Upload to DingTalk
         media_id = await self._upload_media(image_bytes, "image", filename)
         if not media_id:
-            return await self.send(chat_id, f"[Image]({image_url})" + (f"\n{caption}" if caption else ""))
+            return await self.send(chat_id, f"[Image]({image_url})" + (f"\n{caption}" if caption else ""), reply_to=reply_to, metadata=metadata)
 
         # Prefer session webhook; fall back to proactive API.
         result = await self._send_media_via_webhook(
@@ -1010,7 +1013,8 @@ class DingTalkAdapter(BasePlatformAdapter):
         filename = os.path.basename(audio_path) or "audio.amr"
         media_id = await self._upload_media(audio_bytes, "voice", filename)
         if not media_id:
-            return await self.send(chat_id, f"🔊 Audio: {audio_path}" + (f"\n{caption}" if caption else ""))
+            text = f"🔊 **{filename}**\n（语音文件发送失败）" + (f"\n{caption}" if caption else "")
+            return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
 
         duration_ms = self._get_audio_duration_ms(audio_path)
         result = await self._send_media_via_webhook(
@@ -1047,7 +1051,8 @@ class DingTalkAdapter(BasePlatformAdapter):
         filename = file_name or os.path.basename(file_path) or "document"
         media_id = await self._upload_media(file_bytes, "file", filename)
         if not media_id:
-            return await self.send(chat_id, f"📎 File: {file_path}" + (f"\n{caption}" if caption else ""))
+            text = f"📎 **{filename}**\n（文件发送失败）" + (f"\n{caption}" if caption else "")
+            return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
 
         file_type = os.path.splitext(filename)[1].lstrip(".") or "bin"
         result = await self._send_media_via_webhook(
@@ -1082,7 +1087,8 @@ class DingTalkAdapter(BasePlatformAdapter):
         filename = os.path.basename(video_path) or "video.mp4"
         media_id = await self._upload_media(video_bytes, "video", filename)
         if not media_id:
-            return await self.send(chat_id, f"🎬 Video: {video_path}" + (f"\n{caption}" if caption else ""))
+            text = f"🎬 **{filename}**\n（视频发送失败）" + (f"\n{caption}" if caption else "")
+            return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
 
         file_ext = os.path.splitext(filename)[1].lstrip(".").lower() or "mp4"
         result = await self._send_media_via_webhook(
@@ -1110,20 +1116,18 @@ class DingTalkAdapter(BasePlatformAdapter):
         if not self._http_client:
             return None
         try:
-            headers = await self._dingtalk_headers()
-        except RuntimeError as e:
-            logger.warning("[%s] _upload_media: token error: %s", self.name, e)
-            return None
-
-        # Remove Content-Type from headers — we set it manually with the boundary
-        upload_headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
-
-        try:
-            body, boundary = self._build_multipart(data, media_type, filename)
-            upload_headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+            body, boundary = self._build_multipart(data, filename)
+            # oapi.dingtalk.com takes access_token and media type as query params.
+            # Do NOT send x-acs-dingtalk-access-token header — use ?access_token=.
+            token = await self._get_access_token()
+            upload_url = (
+                f"{_DINGTALK_OAPI_BASE}/media/upload"
+                f"?access_token={token}&type={media_type}"
+            )
+            oapi_headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
             resp = await self._http_client.post(
-                f"{_DINGTALK_API_BASE}/robot/messageFiles/upload",
-                headers=upload_headers,
+                upload_url,
+                headers=oapi_headers,
                 content=body,
                 timeout=30.0,
             )
@@ -1132,37 +1136,27 @@ class DingTalkAdapter(BasePlatformAdapter):
                                self.name, resp.status_code, resp.text[:200])
                 return None
             result = resp.json()
-            media_id = result.get("mediaId")
+            # oapi.dingtalk.com returns errcode=0 and media_id (snake_case).
+            if result.get("errcode", -1) != 0:
+                logger.warning("[%s] Media upload error response: %s", self.name, str(result)[:200])
+                return None
+            media_id = result.get("media_id")
             if not media_id:
-                logger.warning("[%s] No mediaId in upload response: %s", self.name, str(result)[:200])
+                logger.warning("[%s] No media_id in upload response: %s", self.name, str(result)[:200])
             return media_id
         except Exception as e:
             logger.warning("[%s] Media upload error: %s", self.name, e)
             return None
 
-    def _build_multipart(self, data: bytes, media_type: str, filename: str) -> bytes:
-        """Build a multipart/form-data body for the DingTalk media upload API.
+    def _build_multipart(self, data: bytes, filename: str) -> tuple:
+        """Build a multipart/form-data body for the DingTalk oapi media upload.
 
-        Fields: robotCode, mediaType, uploadedFileName, media (binary).
-        Returns raw bytes with a unique boundary; the caller must set the
-        Content-Type header to multipart/form-data; boundary=<boundary>.
-        We return (body_bytes, boundary) so the caller can set the header.
+        The oapi.dingtalk.com/media/upload endpoint expects a single 'media' field.
+        media_type and access_token are passed as query parameters, not form fields.
+        Returns (body_bytes, boundary).
         """
         boundary = uuid.uuid4().hex
-
-        def field(name: str, value: str) -> bytes:
-            return (
-                f"--{boundary}\r\n"
-                f'Content-Disposition: form-data; name="{name}"\r\n'
-                f"\r\n"
-                f"{value}\r\n"
-            ).encode()
-
-        body = b""
-        body += field("robotCode", self._client_id)
-        body += field("mediaType", media_type)
-        body += field("uploadedFileName", filename)
-        body += (
+        body = (
             f"--{boundary}\r\n"
             f'Content-Disposition: form-data; name="media"; filename="{filename}"\r\n'
             f"Content-Type: application/octet-stream\r\n"
