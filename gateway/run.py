@@ -7679,7 +7679,7 @@ def main():
     
     # Run the gateway - exit with code 1 if no platforms connected,
     # so systemd Restart=on-failure will retry on transient errors (e.g. DNS)
-    success = asyncio.run(start_gateway(config))
+    success = asyncio.run(start_gateway(config, verbosity=1 if args.verbose else 0))
     if not success:
         sys.exit(1)
 
