@@ -935,7 +935,12 @@ class DingTalkAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         **kwargs,
     ) -> SendResult:
-        """Send a video to a DingTalk chat via sampleVideo template."""
+        """Send a video to a DingTalk chat.
+
+        Uses sampleFile template instead of sampleVideo because sampleVideo
+        requires a valid thumbnail mediaId (picMediaId); passing an empty string
+        causes an API error and there is no server-side thumbnail generation.
+        """
         try:
             with open(video_path, "rb") as f:
                 video_bytes = f.read()
@@ -947,17 +952,16 @@ class DingTalkAdapter(BasePlatformAdapter):
         if not media_id:
             return await self.send(chat_id, f"🎬 Video: {video_path}" + (f"\n{caption}" if caption else ""))
 
-        duration_ms = self._get_audio_duration_ms(video_path)
-        video_size = len(video_bytes)
-        return await self._send_media_proactive(
-            chat_id, "sampleVideo",
-            {
-                "mediaId": media_id,
-                "videoThumbnailURL": "",
-                "duration": str(duration_ms),
-                "videoSize": str(video_size),
-            },
+        # sampleVideo requires a valid picMediaId (thumbnail); passing an empty string
+        # causes an API error. Fall back to sampleFile which works without a thumbnail.
+        file_ext = os.path.splitext(filename)[1].lstrip(".").lower() or "mp4"
+        result = await self._send_media_proactive(
+            chat_id, "sampleFile",
+            {"mediaId": media_id, "fileName": filename, "fileType": file_ext},
         )
+        if caption and result.success:
+            await self.send(chat_id, caption, reply_to=reply_to)
+        return result
 
     async def _upload_media(
         self,

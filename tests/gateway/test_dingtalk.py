@@ -1983,12 +1983,12 @@ class TestSendVideo:
 
         assert result.success is True
         send_payload = adapter._http_client.post.call_args_list[-1][1]["json"]
-        assert send_payload["msgKey"] == "sampleVideo"
+        # sampleVideo requires a thumbnail mediaId; we fall back to sampleFile
+        assert send_payload["msgKey"] == "sampleFile"
         msg_param = json.loads(send_payload["msgParam"])
         assert msg_param["mediaId"] == "media-vid-1"
-        assert "duration" in msg_param
-        assert "videoSize" in msg_param
-        assert msg_param["videoThumbnailURL"] == ""
+        assert msg_param["fileName"] == "clip.mp4"
+        assert msg_param["fileType"] == "mp4"
         mod._TOKEN_CACHE.pop("bot-id", None)
 
     @pytest.mark.asyncio
@@ -2014,8 +2014,10 @@ class TestSendVideo:
         await adapter.send_video("cidGROUP1", str(vid))
 
         send_payload = adapter._http_client.post.call_args_list[-1][1]["json"]
+        assert send_payload["msgKey"] == "sampleFile"
         msg_param = json.loads(send_payload["msgParam"])
-        assert msg_param["videoSize"] == str(len(content))
+        assert msg_param["fileName"] == "clip.mp4"
+        assert msg_param["fileType"] == "mp4"
         mod._TOKEN_CACHE.pop("bot-id", None)
 
     @pytest.mark.asyncio
