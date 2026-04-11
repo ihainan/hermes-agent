@@ -127,11 +127,21 @@ class DingTalkAdapter(BasePlatformAdapter):
         # Disable with config.extra.ack_reaction = "none"
         ack_cfg = (extra.get("ack_reaction") or "emoji").strip().lower()
         self._ack_reaction_enabled: bool = ack_cfg != "none"
-        self._ACK_PENDING = "⏳"    # added on message receipt
-        self._ACK_SUCCESS = "✅"    # swapped in after successful send
-        self._ACK_ERROR   = "❌"    # swapped in after failed send
-        # Track in-flight reactions: msg_id → (chat_id, pending_emoji)
-        self._pending_reactions: Dict[str, tuple] = {}
+        # DingTalk native "thinking" reaction — only one type is supported.
+        # Attached on message receipt, recalled when the response is sent.
+        _THINKING_REACTION = "🤔思考中"
+        self._THINKING_EMOTION_PAYLOAD = {
+            "emotionType": 2,
+            "emotionName": _THINKING_REACTION,
+            "textEmotion": {
+                "emotionId": "2659900",
+                "emotionName": _THINKING_REACTION,
+                "text": _THINKING_REACTION,
+                "backgroundId": "im_bg_1",
+            },
+        }
+        # Track in-flight reactions: msg_id → chat_id
+        self._pending_reactions: Dict[str, str] = {}
 
     # -- Connection lifecycle -----------------------------------------------
 
@@ -346,8 +356,8 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         # Acknowledge receipt with a reaction before the agent starts (issue #6)
         if self._ack_reaction_enabled and chat_id:
-            await self._add_reaction(msg_id, chat_id, self._ACK_PENDING)
-            self._pending_reactions[msg_id] = (chat_id, self._ACK_PENDING)
+            await self._add_reaction(msg_id, chat_id)
+            self._pending_reactions[msg_id] = chat_id
 
         await self.handle_message(event)
 
@@ -1092,64 +1102,94 @@ class DingTalkAdapter(BasePlatformAdapter):
 
     # -- Emoji reaction acknowledgment (issue #6) ---------------------------
 
-    async def _add_reaction(self, msg_id: str, chat_id: str, emoji: str) -> None:
-        """Add an emoji reaction to an inbound DingTalk message.
+    async def _add_reaction(self, msg_id: str, chat_id: str) -> None:
+        """Attach the DingTalk native "thinking" reaction to an inbound message.
 
-        Calls POST /v1.0/robot/emotion/reply. Failures are logged as warnings
-        and never propagate — reactions are purely cosmetic feedback.
+        Calls POST /v1.0/robot/emotion/reply with the platform-specific
+        textEmotion payload. Failures are non-fatal (reactions are cosmetic).
+        Retries up to 3 times on transient 5xx errors, matching the reference
+        implementation's retry pattern.
         """
         if not self._http_client:
             return
-        try:
-            headers = await self._dingtalk_headers()
-            resp = await self._http_client.post(
-                f"{_DINGTALK_API_BASE}/robot/emotion/reply",
-                json={"robotCode": self._client_id, "openMsgId": msg_id, "openConversationId": chat_id, "emojiType": emoji},
-                headers=headers,
-                timeout=5.0,
-            )
-            if resp.status_code >= 300:
-                logger.warning("[%s] _add_reaction HTTP %d: %s", self.name, resp.status_code, resp.text[:200])
-            else:
-                logger.debug("[%s] _add_reaction OK HTTP %d", self.name, resp.status_code)
-        except Exception as e:
-            logger.warning("[%s] _add_reaction failed (non-fatal): %s", self.name, e)
+        body = {
+            "robotCode": self._client_id,
+            "openMsgId": msg_id,
+            "openConversationId": chat_id,
+            **self._THINKING_EMOTION_PAYLOAD,
+        }
+        delays = [0, 0.4, 1.2]
+        for i, delay in enumerate(delays):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                headers = await self._dingtalk_headers()
+                resp = await self._http_client.post(
+                    f"{_DINGTALK_API_BASE}/robot/emotion/reply",
+                    json=body,
+                    headers=headers,
+                    timeout=5.0,
+                )
+                if resp.status_code < 300:
+                    logger.debug("[%s] _add_reaction OK (attempt %d)", self.name, i + 1)
+                    return
+                if resp.status_code < 500:
+                    logger.warning("[%s] _add_reaction HTTP %d: %s", self.name, resp.status_code, resp.text[:200])
+                    return  # non-retryable
+                logger.warning("[%s] _add_reaction HTTP %d (attempt %d), %s",
+                               self.name, resp.status_code, i + 1,
+                               "retrying" if i < len(delays) - 1 else "giving up")
+            except Exception as e:
+                logger.warning("[%s] _add_reaction failed (non-fatal, attempt %d): %s", self.name, i + 1, e)
+                return
 
-    async def _remove_reaction(self, msg_id: str, chat_id: str, emoji: str) -> None:
-        """Remove an emoji reaction from an inbound DingTalk message.
+    async def _remove_reaction(self, msg_id: str, chat_id: str) -> None:
+        """Recall the DingTalk native "thinking" reaction from a message.
 
-        Calls DELETE /v1.0/robot/emotion/recall. Failures are non-fatal.
+        Calls POST /v1.0/robot/emotion/recall. Retries up to 3 times on
+        transient failures (reference impl uses delays [0, 1.5s, 5s]).
         """
         if not self._http_client:
             return
-        try:
-            headers = await self._dingtalk_headers()
-            await self._http_client.request(
-                "DELETE",
-                f"{_DINGTALK_API_BASE}/robot/emotion/recall",
-                json={"robotCode": self._client_id, "openMsgId": msg_id, "openConversationId": chat_id, "emojiType": emoji},
-                headers=headers,
-                timeout=5.0,
-            )
-        except Exception as e:
-            logger.warning("[%s] _remove_reaction failed (non-fatal): %s", self.name, e)
+        body = {
+            "robotCode": self._client_id,
+            "openMsgId": msg_id,
+            "openConversationId": chat_id,
+            **self._THINKING_EMOTION_PAYLOAD,
+        }
+        delays = [0, 1.5, 5.0]
+        for i, delay in enumerate(delays):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                headers = await self._dingtalk_headers()
+                resp = await self._http_client.post(
+                    f"{_DINGTALK_API_BASE}/robot/emotion/recall",
+                    json=body,
+                    headers=headers,
+                    timeout=5.0,
+                )
+                if resp.status_code < 300:
+                    logger.debug("[%s] _remove_reaction OK (attempt %d)", self.name, i + 1)
+                    return
+                if resp.status_code < 500:
+                    return  # non-retryable
+            except Exception as e:
+                logger.warning("[%s] _remove_reaction failed (non-fatal, attempt %d): %s", self.name, i + 1, e)
+                return
 
     async def _finalize_reaction(self, msg_id: Optional[str], result: SendResult) -> None:
-        """Swap the pending ⏳ reaction to ✅ or ❌ after a send completes.
+        """Recall the pending "thinking" reaction after a send completes.
 
-        Looks up the pending reaction by msg_id. If found, removes the pending
-        emoji and adds the outcome emoji. No-op when reactions are disabled or
-        msg_id is not tracked.
+        The native DingTalk reaction flow only supports attach-then-recall.
+        We always recall regardless of send success/failure.
         """
         if not self._ack_reaction_enabled or not msg_id:
             return
-        pending = self._pending_reactions.pop(msg_id, None)
-        if not pending:
+        chat_id = self._pending_reactions.pop(msg_id, None)
+        if not chat_id:
             return
-        chat_id, pending_emoji = pending
-        await self._remove_reaction(msg_id, chat_id, pending_emoji)
-        outcome_emoji = self._ACK_SUCCESS if result.success else self._ACK_ERROR
-        await self._add_reaction(msg_id, chat_id, outcome_emoji)
+        await self._remove_reaction(msg_id, chat_id)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """DingTalk does not support typing indicators."""
