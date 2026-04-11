@@ -4401,6 +4401,9 @@ class GatewayRunner:
             local_files, _ = adapter.extract_local_files(cleaned)
 
             _thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+            # Pass the original message ID so platform adapters can finalize
+            # the "thinking" reaction (e.g. DingTalk emoji removal) after delivery.
+            _reply_to = event.message_id
 
             _AUDIO_EXTS = {'.ogg', '.opus', '.mp3', '.wav', '.m4a'}
             _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
@@ -4413,24 +4416,28 @@ class GatewayRunner:
                         await adapter.send_voice(
                             chat_id=event.source.chat_id,
                             audio_path=media_path,
+                            reply_to=_reply_to,
                             metadata=_thread_meta,
                         )
                     elif ext in _VIDEO_EXTS:
                         await adapter.send_video(
                             chat_id=event.source.chat_id,
                             video_path=media_path,
+                            reply_to=_reply_to,
                             metadata=_thread_meta,
                         )
                     elif ext in _IMAGE_EXTS:
                         await adapter.send_image_file(
                             chat_id=event.source.chat_id,
                             image_path=media_path,
+                            reply_to=_reply_to,
                             metadata=_thread_meta,
                         )
                     else:
                         await adapter.send_document(
                             chat_id=event.source.chat_id,
                             file_path=media_path,
+                            reply_to=_reply_to,
                             metadata=_thread_meta,
                         )
                 except Exception as e:
@@ -4443,12 +4450,14 @@ class GatewayRunner:
                         await adapter.send_image_file(
                             chat_id=event.source.chat_id,
                             image_path=file_path,
+                            reply_to=_reply_to,
                             metadata=_thread_meta,
                         )
                     else:
                         await adapter.send_document(
                             chat_id=event.source.chat_id,
                             file_path=file_path,
+                            reply_to=_reply_to,
                             metadata=_thread_meta,
                         )
                 except Exception as e:
@@ -7666,7 +7675,7 @@ def main():
     
     parser = argparse.ArgumentParser(description="Hermes Gateway - Multi-platform messaging")
     parser.add_argument("--config", "-c", help="Path to gateway config file")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    parser.add_argument("--verbose", "-v", action="count", default=0, help="Verbose output (-v=INFO, -vv=DEBUG)")
     parser.add_argument(
         "--replace", "-r",
         action="store_true",
@@ -7684,7 +7693,7 @@ def main():
 
     # Run the gateway - exit with code 1 if no platforms connected,
     # so systemd Restart=on-failure will retry on transient errors (e.g. DNS)
-    success = asyncio.run(start_gateway(config, replace=args.replace, verbosity=1 if args.verbose else 0))
+    success = asyncio.run(start_gateway(config, replace=args.replace, verbosity=args.verbose))
     if not success:
         sys.exit(1)
 

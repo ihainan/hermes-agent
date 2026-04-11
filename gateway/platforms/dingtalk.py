@@ -875,10 +875,10 @@ class DingTalkAdapter(BasePlatformAdapter):
         session webhook is available (caller should fall back to proactive API).
 
         DingTalk session webhook supports native media types:
-            image: { "msgtype": "image", "image": { "media_id": "..." } }
-            voice: { "msgtype": "voice", "voice": { "media_id": "...", "duration": "5" } }
-            file:  { "msgtype": "file",  "file":  { "media_id": "..." } }
-            video: { "msgtype": "video", "video": { "media_id": "..." } }
+            image: { "msgtype": "image", "image": { "mediaId": "..." } }
+            voice: { "msgtype": "voice", "voice": { "mediaId": "...", "duration": "5" } }
+            file:  { "msgtype": "file",  "file":  { "mediaId": "...", "fileName": "...", "fileType": "..." } }
+            video: { "msgtype": "video", "video": { "mediaId": "...", "fileName": "...", "fileType": "..." } }
         """
         metadata = metadata or {}
         session_webhook = metadata.get("session_webhook") or self._session_webhooks.get(chat_id)
@@ -893,15 +893,28 @@ class DingTalkAdapter(BasePlatformAdapter):
             resp = await self._http_client.post(
                 session_webhook, json=payload, headers=headers, timeout=15.0
             )
-            if resp.status_code < 300:
-                logger.debug("[%s] Media sent via session_webhook (type=%s)", self.name, msgtype)
-                return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
             body = resp.text
-            logger.warning(
-                "[%s] session_webhook media send failed HTTP %d: %s",
-                self.name, resp.status_code, body[:200],
-            )
-            return SendResult(success=False, error=f"HTTP {resp.status_code}: {body[:200]}")
+            if resp.status_code >= 300:
+                logger.warning(
+                    "[%s] session_webhook media send failed HTTP %d: %s",
+                    self.name, resp.status_code, body[:200],
+                )
+                return SendResult(success=False, error=f"HTTP {resp.status_code}: {body[:200]}")
+            # DingTalk may return HTTP 200 with errcode != 0 on logical errors.
+            try:
+                result_json = resp.json()
+                errcode = result_json.get("errcode", 0)
+                if errcode != 0:
+                    errmsg = result_json.get("errmsg", "unknown")
+                    logger.warning(
+                        "[%s] session_webhook media send errcode=%d errmsg=%s (type=%s)",
+                        self.name, errcode, errmsg, msgtype,
+                    )
+                    return SendResult(success=False, error=f"errcode={errcode}: {errmsg}")
+            except Exception:
+                pass
+            logger.debug("[%s] Media sent via session_webhook (type=%s) body=%s", self.name, msgtype, body[:100])
+            return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
         except Exception as e:
             logger.warning(
                 "[%s] session_webhook media send error (%s), will try proactive API", self.name, e
@@ -946,7 +959,7 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         # Prefer session webhook; fall back to proactive API.
         result = await self._send_media_via_webhook(
-            chat_id, "image", {"media_id": media_id}, metadata
+            chat_id, "image", {"mediaId": media_id}, metadata
         ) or await self._send_media_proactive(chat_id, "sampleImageMsg", {"photoURL": media_id})
         if caption and result.success:
             await self.send(chat_id, caption, reply_to=reply_to, metadata=metadata)
@@ -982,7 +995,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             )
 
         result = await self._send_media_via_webhook(
-            chat_id, "image", {"media_id": media_id}, metadata
+            chat_id, "image", {"mediaId": media_id}, metadata
         ) or await self._send_media_proactive(chat_id, "sampleImageMsg", {"photoURL": media_id})
         if caption and result.success:
             await self.send(chat_id, caption, reply_to=reply_to, metadata=metadata)
@@ -1019,7 +1032,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         duration_ms = self._get_audio_duration_ms(audio_path)
         result = await self._send_media_via_webhook(
             chat_id, "voice",
-            {"media_id": media_id, "duration": str(duration_ms)},
+            {"mediaId": media_id, "duration": str(duration_ms)},
             metadata,
         ) or await self._send_media_proactive(
             chat_id, "sampleAudio",
@@ -1056,7 +1069,9 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         file_type = os.path.splitext(filename)[1].lstrip(".") or "bin"
         result = await self._send_media_via_webhook(
-            chat_id, "file", {"media_id": media_id}, metadata,
+            chat_id, "file",
+            {"mediaId": media_id, "fileName": filename, "fileType": file_type},
+            metadata,
         ) or await self._send_media_proactive(
             chat_id, "sampleFile",
             {"mediaId": media_id, "fileName": filename, "fileType": file_type},
@@ -1092,7 +1107,9 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         file_ext = os.path.splitext(filename)[1].lstrip(".").lower() or "mp4"
         result = await self._send_media_via_webhook(
-            chat_id, "video", {"media_id": media_id}, metadata,
+            chat_id, "video",
+            {"mediaId": media_id, "fileName": filename, "fileType": file_ext},
+            metadata,
         ) or await self._send_media_proactive(
             chat_id, "sampleFile",
             {"mediaId": media_id, "fileName": filename, "fileType": file_ext},
@@ -1316,8 +1333,10 @@ class DingTalkAdapter(BasePlatformAdapter):
         We always recall regardless of send success/failure.
         """
         if not self._ack_reaction_enabled or not msg_id:
+            logger.debug("[%s] _finalize_reaction skipped: enabled=%s msg_id=%r", self.name, self._ack_reaction_enabled, msg_id)
             return
         chat_id = self._pending_reactions.pop(msg_id, None)
+        logger.debug("[%s] _finalize_reaction: msg_id=%r chat_id=%r pending_keys=%s", self.name, msg_id, chat_id, list(self._pending_reactions.keys())[:5])
         if not chat_id:
             return
         await self._remove_reaction(msg_id, chat_id)

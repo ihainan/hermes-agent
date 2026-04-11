@@ -1619,7 +1619,8 @@ class TestSendImage:
     def _ok_send_resp(self):
         resp = MagicMock()
         resp.status_code = 200
-        resp.text = ""
+        resp.text = '{"errcode": 0, "errmsg": "ok"}'
+        resp.json.return_value = {"errcode": 0, "errmsg": "ok"}
         return resp
 
     @pytest.mark.asyncio
@@ -2386,7 +2387,8 @@ class TestReactionIntegration:
     def _ok_send_resp(self):
         r = MagicMock()
         r.status_code = 200
-        r.text = ""
+        r.text = '{"errcode": 0, "errmsg": "ok"}'
+        r.json.return_value = {"errcode": 0, "errmsg": "ok"}
         return r
 
     @pytest.mark.asyncio
