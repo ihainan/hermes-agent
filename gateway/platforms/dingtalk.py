@@ -710,19 +710,36 @@ class DingTalkAdapter(BasePlatformAdapter):
                 "msgtype": "markdown",
                 "markdown": {"title": "Hermes", "text": content[:self.MAX_MESSAGE_LENGTH]},
             }
+            logger.debug("[%s] Sending via session_webhook: %s", self.name, session_webhook[:80])
+            # Fetch auth headers before the network call so token errors don't
+            # mask real network failures.  On token error fall back to proactive.
             try:
-                resp = await self._http_client.post(session_webhook, json=payload, timeout=15.0)
+                _headers = await self._dingtalk_headers()
+            except Exception as e:
+                logger.warning("[%s] Token error before session_webhook send, falling back to proactive: %s", self.name, e)
+                result = await self._send_proactive(chat_id, content)
+                await self._finalize_reaction(reply_to, result)
+                return result
+
+            _session_result: Optional[SendResult] = None
+            try:
+                resp = await self._http_client.post(session_webhook, json=payload, headers=_headers, timeout=15.0)
                 if resp.status_code < 300:
-                    result = SendResult(success=True, message_id=uuid.uuid4().hex[:12])
+                    _session_result = SendResult(success=True, message_id=uuid.uuid4().hex[:12])
                 else:
                     body = resp.text
                     logger.warning("[%s] Send failed HTTP %d: %s", self.name, resp.status_code, body[:200])
-                    result = SendResult(success=False, error=f"HTTP {resp.status_code}: {body[:200]}")
+                    _session_result = SendResult(success=False, error=f"HTTP {resp.status_code}: {body[:200]}")
             except httpx.TimeoutException:
-                result = SendResult(success=False, error="Timeout sending message to DingTalk")
+                logger.warning("[%s] session_webhook timed out, falling back to proactive API", self.name)
             except Exception as e:
-                logger.error("[%s] Send error: %s", self.name, e)
-                result = SendResult(success=False, error=str(e))
+                logger.warning("[%s] session_webhook network error (%s), falling back to proactive API", self.name, e)
+
+            if _session_result is not None:
+                result = _session_result
+            else:
+                # Network-level failure — fall back to proactive API
+                result = await self._send_proactive(chat_id, content)
         else:
             # No session_webhook — use proactive robot API
             logger.debug("[%s] No session_webhook for %s, using proactive API", self.name, chat_id[:20])

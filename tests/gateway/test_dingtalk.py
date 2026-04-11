@@ -152,6 +152,10 @@ class TestSend:
 
     @pytest.mark.asyncio
     async def test_send_posts_to_webhook(self):
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE[""] = ("tok", _time.time() + 3600)
+
         from gateway.platforms.dingtalk import DingTalkAdapter
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
 
@@ -175,6 +179,7 @@ class TestSend:
         assert payload["msgtype"] == "markdown"
         assert payload["markdown"]["title"] == "Hermes"
         assert payload["markdown"]["text"] == "Hello!"
+        mod._TOKEN_CACHE.pop("", None)
 
     @pytest.mark.asyncio
     async def test_send_fails_without_webhook(self):
@@ -306,6 +311,10 @@ class TestProactiveMessaging:
 
     @pytest.mark.asyncio
     async def test_send_prefers_session_webhook(self):
+        import gateway.platforms.dingtalk as mod
+        import time as _time
+        mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
+
         from gateway.platforms.dingtalk import DingTalkAdapter
         adapter = self._make_adapter()
         adapter._session_webhooks["chat-1"] = "https://wh.example/hook"
@@ -316,6 +325,7 @@ class TestProactiveMessaging:
         assert result.success is True
         call_url = adapter._http_client.post.call_args[0][0]
         assert call_url == "https://wh.example/hook"
+        mod._TOKEN_CACHE.pop("bot-id", None)
 
     # -- proactive group --
 
