@@ -67,8 +67,6 @@ DEDUP_WINDOW_SECONDS = 300
 DEDUP_MAX_SIZE = 1000
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 MAX_RECONNECT_ATTEMPTS = 10
-HEALTH_CHECK_INTERVAL = 30          # seconds between health check polls
-HEALTH_CHECK_STALE_THRESHOLD = 120  # seconds without a message before reconnect
 RECONNECT_JITTER_FACTOR = 0.2       # ±20% jitter applied to backoff delays
 
 # OAuth token management
@@ -112,7 +110,6 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         self._stream_client: Any = None
         self._stream_task: Optional[asyncio.Task] = None
-        self._health_check_task: Optional[asyncio.Task] = None
         self._http_client: Optional["httpx.AsyncClient"] = None
 
         self._last_message_at: float = 0.0
@@ -156,7 +153,6 @@ class DingTalkAdapter(BasePlatformAdapter):
             self._consecutive_failures = 0
 
             self._stream_task = asyncio.create_task(self._run_stream())
-            self._health_check_task = asyncio.create_task(self._health_check_loop())
             self._mark_connected()
             logger.info("[%s] Connected via Stream Mode", self.name)
 
@@ -179,6 +175,13 @@ class DingTalkAdapter(BasePlatformAdapter):
         Rebuilds a fresh DingTalkStreamClient on each attempt (warm reconnect).
         Applies ±20% jitter to backoff delays to avoid thundering herd.
         Calls _set_fatal_error() after MAX_RECONNECT_ATTEMPTS consecutive failures.
+
+        NOTE: DingTalkStreamClient.start() already has an internal while-True reconnect
+        loop and spawns a keepalive() task that sends WebSocket pings every 60 seconds.
+        We do NOT need an external health check based on idle message time — that approach
+        caused spurious reconnects during quiet periods (issue #17). If start() exits
+        cleanly (rare), or raises an exception that escapes the SDK's own try/catch,
+        this outer loop rebuilds a fresh client and retries.
         """
         backoff_idx = 0
         while self._running:
@@ -240,14 +243,6 @@ class DingTalkAdapter(BasePlatformAdapter):
                 pass
             self._stream_task = None
 
-        if self._health_check_task:
-            self._health_check_task.cancel()
-            try:
-                await self._health_check_task
-            except asyncio.CancelledError:
-                pass
-            self._health_check_task = None
-
         if self._http_client:
             await self._http_client.aclose()
             self._http_client = None
@@ -260,26 +255,6 @@ class DingTalkAdapter(BasePlatformAdapter):
         self._dm_user_ids.clear()
         self._pending_reactions.clear()
         logger.info("[%s] Disconnected", self.name)
-
-    async def _health_check_loop(self) -> None:
-        """Background task: detect silent WebSocket stalls and trigger reconnect.
-
-        Checks every HEALTH_CHECK_INTERVAL seconds. If no message has arrived
-        in HEALTH_CHECK_STALE_THRESHOLD seconds, cancels the stream task so
-        _run_stream() will rebuild a fresh client and reconnect.
-        """
-        while self._running:
-            await asyncio.sleep(HEALTH_CHECK_INTERVAL)
-            if not self._running:
-                return
-            idle = time.monotonic() - self._last_message_at
-            if idle > HEALTH_CHECK_STALE_THRESHOLD:
-                logger.warning(
-                    "[%s] No message received for %.0fs, triggering reconnect",
-                    self.name, idle,
-                )
-                if self._stream_task and not self._stream_task.done():
-                    self._stream_task.cancel()
 
     # -- Inbound message processing -----------------------------------------
 
@@ -386,10 +361,18 @@ class DingTalkAdapter(BasePlatformAdapter):
         On download failure falls back to text-only (never drops the message).
         """
         msgtype = getattr(message, "message_type", None) or getattr(message, "msgtype", None) or "text"
-        # SDK stores media content in type-specific fields; use content as a fallback dict
-        content = getattr(message, "content", None) or {}
-        if not isinstance(content, dict):
-            content = {}
+        # The SDK only parses text/picture/richText into typed fields.
+        # For audio/video/file the raw `content` dict lands in extensions["content"].
+        extensions = getattr(message, "extensions", {}) or {}
+        raw_content = extensions.get("content") or {}
+        if isinstance(raw_content, str):
+            try:
+                import json as _json
+                raw_content = _json.loads(raw_content)
+            except Exception:
+                raw_content = {}
+        if not isinstance(raw_content, dict):
+            raw_content = {}
 
         media_urls: list = []
         media_types: list = []
@@ -398,18 +381,18 @@ class DingTalkAdapter(BasePlatformAdapter):
             image_content = getattr(message, "image_content", None)
             download_code = (
                 getattr(image_content, "download_code", None)
-                or content.get("downloadCode", "")
+                or raw_content.get("downloadCode", "")
             )
             if download_code:
                 path, mime = await self._download_media(download_code, "image/jpeg", ".jpg")
                 if path:
                     media_urls.append(path)
                     media_types.append(mime)
-            text = content.get("caption", "") or ""
+            text = raw_content.get("caption", "") or ""
             return text, MessageType.PHOTO, media_urls, media_types
 
         if msgtype == "audio":
-            download_code = content.get("downloadCode", "")
+            download_code = raw_content.get("downloadCode", "")
             if download_code:
                 path, mime = await self._download_media(download_code, "audio/amr", ".amr")
                 if path:
@@ -418,7 +401,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             return "", MessageType.VOICE, media_urls, media_types
 
         if msgtype == "video":
-            download_code = content.get("downloadCode", "")
+            download_code = raw_content.get("downloadCode", "")
             if download_code:
                 path, mime = await self._download_media(download_code, "video/mp4", ".mp4")
                 if path:
@@ -427,8 +410,8 @@ class DingTalkAdapter(BasePlatformAdapter):
             return "", MessageType.VIDEO, media_urls, media_types
 
         if msgtype == "file":
-            download_code = content.get("downloadCode", "")
-            file_name = content.get("fileName", "document") or "document"
+            download_code = raw_content.get("downloadCode", "")
+            file_name = raw_content.get("fileName", "document") or "document"
             if download_code:
                 path, mime = await self._download_media(
                     download_code, "application/octet-stream", None, file_name
@@ -444,8 +427,8 @@ class DingTalkAdapter(BasePlatformAdapter):
             rich_parts = []
             if rich_text_content and hasattr(rich_text_content, "rich_text_list"):
                 rich_parts = rich_text_content.rich_text_list or []
-            elif isinstance(content.get("richText"), list):
-                rich_parts = content["richText"]
+            elif isinstance(raw_content.get("richText"), list):
+                rich_parts = raw_content["richText"]
             text_parts = []
             for part in rich_parts:
                 if not isinstance(part, dict):
@@ -852,15 +835,12 @@ class DingTalkAdapter(BasePlatformAdapter):
         if not media_id:
             return await self.send(chat_id, f"[Image]({image_url})" + (f"\n{caption}" if caption else ""))
 
-        # Send via sampleImageMsg — photoURL field requires a public URL; DingTalk
-        # recommends using the mediaId path. We pass the original URL instead since
-        # DingTalk's image template uses photoURL (a CDN URL), not mediaId.
-        # Use sampleMarkdown with an embedded image link as the most reliable path.
-        text = f"![]({image_url})"
-        if caption:
-            text = f"{text}\n{caption}"
-        return await self._send_media_proactive(chat_id, "sampleMarkdown",
-                                                 {"title": "Image", "text": text})
+        # Send via sampleImageMsg using the uploaded mediaId.
+        result = await self._send_media_proactive(chat_id, "sampleImageMsg", {"photoURL": media_id})
+        # If there is a caption, send it as a follow-up markdown message.
+        if caption and result.success:
+            await self.send(chat_id, caption, reply_to=reply_to, metadata=metadata)
+        return result
 
     async def send_voice(
         self,
@@ -887,10 +867,10 @@ class DingTalkAdapter(BasePlatformAdapter):
         if not media_id:
             return await self.send(chat_id, f"🔊 Audio: {audio_path}" + (f"\n{caption}" if caption else ""))
 
-        duration = self._get_audio_duration(audio_path)
+        duration_ms = self._get_audio_duration_ms(audio_path)
         return await self._send_media_proactive(
             chat_id, "sampleAudio",
-            {"mediaId": media_id, "duration": str(duration)},
+            {"mediaId": media_id, "duration": str(duration_ms)},
         )
 
     async def send_document(
@@ -940,14 +920,14 @@ class DingTalkAdapter(BasePlatformAdapter):
         if not media_id:
             return await self.send(chat_id, f"🎬 Video: {video_path}" + (f"\n{caption}" if caption else ""))
 
-        duration = self._get_audio_duration(video_path)
+        duration_ms = self._get_audio_duration_ms(video_path)
         video_size = len(video_bytes)
         return await self._send_media_proactive(
             chat_id, "sampleVideo",
             {
                 "mediaId": media_id,
                 "videoThumbnailURL": "",
-                "duration": str(duration),
+                "duration": str(duration_ms),
                 "videoSize": str(video_size),
             },
         )
@@ -1076,9 +1056,10 @@ class DingTalkAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e))
 
     @staticmethod
-    def _get_audio_duration(path: str) -> int:
-        """Return audio/video duration in seconds using mutagen (soft dependency).
+    def _get_audio_duration_ms(path: str) -> int:
+        """Return audio/video duration in milliseconds using mutagen (soft dependency).
 
+        DingTalk sampleAudio/sampleVideo templates expect duration in milliseconds.
         Returns 0 if mutagen is not installed or the file cannot be parsed.
         See issue #9 for tracking accurate duration support.
         """
@@ -1087,7 +1068,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         try:
             audio = mutagen.File(path)  # type: ignore[union-attr]
             if audio and hasattr(audio, "info") and hasattr(audio.info, "length"):
-                return max(1, int(audio.info.length))
+                return max(1, int(audio.info.length * 1000))
         except Exception:
             pass
         return 0
@@ -1104,12 +1085,16 @@ class DingTalkAdapter(BasePlatformAdapter):
             return
         try:
             headers = await self._dingtalk_headers()
-            await self._http_client.post(
+            resp = await self._http_client.post(
                 f"{_DINGTALK_API_BASE}/robot/emotion/reply",
-                json={"msgId": msg_id, "conversationId": chat_id, "emojiType": emoji},
+                json={"robotCode": self._client_id, "msgId": msg_id, "conversationId": chat_id, "emojiType": emoji},
                 headers=headers,
                 timeout=5.0,
             )
+            if resp.status_code >= 300:
+                logger.warning("[%s] _add_reaction HTTP %d: %s", self.name, resp.status_code, resp.text[:200])
+            else:
+                logger.debug("[%s] _add_reaction OK HTTP %d", self.name, resp.status_code)
         except Exception as e:
             logger.warning("[%s] _add_reaction failed (non-fatal): %s", self.name, e)
 
@@ -1125,7 +1110,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             await self._http_client.request(
                 "DELETE",
                 f"{_DINGTALK_API_BASE}/robot/emotion/recall",
-                json={"msgId": msg_id, "conversationId": chat_id, "emojiType": emoji},
+                json={"robotCode": self._client_id, "msgId": msg_id, "conversationId": chat_id, "emojiType": emoji},
                 headers=headers,
                 timeout=5.0,
             )

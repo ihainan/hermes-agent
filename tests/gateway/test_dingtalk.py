@@ -663,63 +663,6 @@ class TestHealthCheckAndReconnection:
         assert adapter._last_message_at >= before
 
     @pytest.mark.asyncio
-    async def test_health_check_cancels_stream_task_when_stale(self):
-        """Health check must cancel stream task when idle > threshold."""
-        import time
-        from gateway.platforms.dingtalk import DingTalkAdapter, HEALTH_CHECK_STALE_THRESHOLD
-
-        adapter = self._make_adapter()
-        adapter._running = True
-        # Simulate last message well beyond threshold
-        adapter._last_message_at = time.monotonic() - HEALTH_CHECK_STALE_THRESHOLD - 10
-
-        mock_task = MagicMock()
-        mock_task.done.return_value = False
-        adapter._stream_task = mock_task
-
-        async def fake_sleep(_):
-            # After sleep, _running is still True so idle check will run.
-            # Stop on next while-condition check by cancelling after this coroutine.
-            pass
-
-        with patch("asyncio.sleep", side_effect=fake_sleep):
-            # Run one iteration manually: sleep → idle check → cancel triggered
-            # Then _running=False so second while check exits
-            adapter._running = True
-            # Run loop but stop it by setting _running=False after cancel fires
-            original_cancel = mock_task.cancel
-            def cancel_and_stop():
-                original_cancel()
-                adapter._running = False
-            mock_task.cancel = MagicMock(side_effect=cancel_and_stop)
-
-            await adapter._health_check_loop()
-
-        mock_task.cancel.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_health_check_does_not_cancel_when_fresh(self):
-        """Health check must NOT cancel stream task when messages are recent."""
-        import time
-        from gateway.platforms.dingtalk import DingTalkAdapter
-
-        adapter = self._make_adapter()
-        adapter._running = True
-        adapter._last_message_at = time.monotonic()  # just now
-
-        mock_task = MagicMock()
-        mock_task.done.return_value = False
-        adapter._stream_task = mock_task
-
-        async def fake_sleep(_):
-            adapter._running = False
-
-        with patch("asyncio.sleep", side_effect=fake_sleep):
-            await adapter._health_check_loop()
-
-        mock_task.cancel.assert_not_called()
-
-    @pytest.mark.asyncio
     async def test_run_stream_resets_failures_on_clean_exit(self):
         """A clean SDK exit must reset _consecutive_failures and backoff."""
         from gateway.platforms.dingtalk import DingTalkAdapter
@@ -832,25 +775,6 @@ class TestHealthCheckAndReconnection:
 
         # Two attempts → two client constructions
         assert mock_dt.DingTalkStreamClient.call_count == 2
-
-    @pytest.mark.asyncio
-    async def test_disconnect_cancels_health_check_task(self):
-        """disconnect() must cancel and await the health check task."""
-        from gateway.platforms.dingtalk import DingTalkAdapter
-        adapter = self._make_adapter()
-
-        # Create a real asyncio task that raises CancelledError when awaited after cancel
-        async def _noop():
-            await asyncio.sleep(9999)
-
-        real_task = asyncio.create_task(_noop())
-        adapter._health_check_task = real_task
-        adapter._stream_task = None
-
-        await adapter.disconnect()
-
-        assert real_task.cancelled()
-        assert adapter._health_check_task is None
 
 
 # ---------------------------------------------------------------------------
@@ -1056,11 +980,19 @@ class TestParseInboundMessage:
         msg = MagicMock()
         msg.message_type = msgtype   # SDK field name (from_dict sets message_type)
         msg.msgtype = msgtype        # keep for backward compat with any fallback path
-        msg.content = content or {}
         msg.text = text or {}
         msg.rich_text = None
-        msg.image_content = None
         msg.rich_text_content = None
+        # SDK stores picture in image_content; audio/video/file content goes into extensions["content"]
+        if msgtype == "picture":
+            from unittest.mock import MagicMock as MM
+            img = MM()
+            img.download_code = (content or {}).get("downloadCode")
+            msg.image_content = img
+            msg.extensions = {}
+        else:
+            msg.image_content = None
+            msg.extensions = {"content": content or {}} if content else {}
         return msg
 
     def _ok_download_resp(self, download_url="https://cdn.example/file"):
@@ -1603,12 +1535,12 @@ class TestSendMediaProactive:
 
 
 class TestGetAudioDuration:
-    """Tests for _get_audio_duration() — soft mutagen dependency."""
+    """Tests for _get_audio_duration_ms() — returns milliseconds, soft mutagen dependency."""
 
     def test_returns_zero_when_mutagen_unavailable(self, monkeypatch):
         monkeypatch.setattr("gateway.platforms.dingtalk.MUTAGEN_AVAILABLE", False)
         from gateway.platforms.dingtalk import DingTalkAdapter
-        assert DingTalkAdapter._get_audio_duration("/any/path.mp3") == 0
+        assert DingTalkAdapter._get_audio_duration_ms("/any/path.mp3") == 0
 
     def test_returns_zero_when_mutagen_returns_none(self, monkeypatch):
         monkeypatch.setattr("gateway.platforms.dingtalk.MUTAGEN_AVAILABLE", True)
@@ -1616,9 +1548,9 @@ class TestGetAudioDuration:
         mock_mutagen.File.return_value = None
         monkeypatch.setattr("gateway.platforms.dingtalk.mutagen", mock_mutagen)
         from gateway.platforms.dingtalk import DingTalkAdapter
-        assert DingTalkAdapter._get_audio_duration("/any/path.mp3") == 0
+        assert DingTalkAdapter._get_audio_duration_ms("/any/path.mp3") == 0
 
-    def test_returns_duration_from_mutagen(self, monkeypatch):
+    def test_returns_duration_ms_from_mutagen(self, monkeypatch):
         monkeypatch.setattr("gateway.platforms.dingtalk.MUTAGEN_AVAILABLE", True)
         mock_audio = MagicMock()
         mock_audio.info.length = 42.7
@@ -1626,7 +1558,7 @@ class TestGetAudioDuration:
         mock_mutagen.File.return_value = mock_audio
         monkeypatch.setattr("gateway.platforms.dingtalk.mutagen", mock_mutagen)
         from gateway.platforms.dingtalk import DingTalkAdapter
-        assert DingTalkAdapter._get_audio_duration("/any/path.mp3") == 42
+        assert DingTalkAdapter._get_audio_duration_ms("/any/path.mp3") == 42700
 
     def test_returns_at_least_one_for_sub_second_audio(self, monkeypatch):
         monkeypatch.setattr("gateway.platforms.dingtalk.MUTAGEN_AVAILABLE", True)
@@ -1636,7 +1568,7 @@ class TestGetAudioDuration:
         mock_mutagen.File.return_value = mock_audio
         monkeypatch.setattr("gateway.platforms.dingtalk.mutagen", mock_mutagen)
         from gateway.platforms.dingtalk import DingTalkAdapter
-        assert DingTalkAdapter._get_audio_duration("/any/path.mp3") == 1
+        assert DingTalkAdapter._get_audio_duration_ms("/any/path.mp3") == 300
 
     def test_returns_zero_on_mutagen_exception(self, monkeypatch):
         monkeypatch.setattr("gateway.platforms.dingtalk.MUTAGEN_AVAILABLE", True)
@@ -1644,7 +1576,7 @@ class TestGetAudioDuration:
         mock_mutagen.File.side_effect = Exception("parse error")
         monkeypatch.setattr("gateway.platforms.dingtalk.mutagen", mock_mutagen)
         from gateway.platforms.dingtalk import DingTalkAdapter
-        assert DingTalkAdapter._get_audio_duration("/bad/path.mp3") == 0
+        assert DingTalkAdapter._get_audio_duration_ms("/bad/path.mp3") == 0
 
 
 class TestSendImage:
@@ -1679,7 +1611,7 @@ class TestSendImage:
         return resp
 
     @pytest.mark.asyncio
-    async def test_sends_markdown_on_success(self):
+    async def test_sends_sampleImageMsg_on_success(self):
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1694,28 +1626,32 @@ class TestSendImage:
 
         assert result.success is True
         send_payload = adapter._http_client.post.call_args_list[-1][1]["json"]
-        assert send_payload["msgKey"] == "sampleMarkdown"
+        assert send_payload["msgKey"] == "sampleImageMsg"
         msg_param = json.loads(send_payload["msgParam"])
-        assert "https://example.com/img.jpg" in msg_param["text"]
+        assert msg_param["photoURL"] == "media-img"
         mod._TOKEN_CACHE.pop("bot-id", None)
 
     @pytest.mark.asyncio
-    async def test_includes_caption_in_markdown(self):
+    async def test_sends_caption_as_followup_message(self):
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
 
         adapter = self._make_adapter()
         adapter._http_client.get = AsyncMock(return_value=self._ok_download_resp())
+        # upload → sampleImageMsg send → caption send (via session webhook)
+        adapter._session_webhooks["cidGROUP1"] = "https://wh.example/hook"
         adapter._http_client.post = AsyncMock(
-            side_effect=[self._ok_upload_resp(), self._ok_send_resp()]
+            side_effect=[self._ok_upload_resp(), self._ok_send_resp(), self._ok_send_resp()]
         )
 
         await adapter.send_image("cidGROUP1", "https://example.com/img.jpg", caption="My photo")
 
-        send_payload = adapter._http_client.post.call_args_list[-1][1]["json"]
-        msg_param = json.loads(send_payload["msgParam"])
-        assert "My photo" in msg_param["text"]
+        # Third call should be the caption follow-up via session webhook
+        assert adapter._http_client.post.call_count == 3
+        caption_call = adapter._http_client.post.call_args_list[-1]
+        caption_payload = caption_call[1]["json"]
+        assert "My photo" in caption_payload["markdown"]["text"]
         mod._TOKEN_CACHE.pop("bot-id", None)
 
     @pytest.mark.asyncio
@@ -2417,7 +2353,6 @@ class TestReactionIntegration:
         adapter = self._make_adapter()
         adapter._pending_reactions["msg-x"] = ("cid-x", "⏳")
         adapter._stream_task = None
-        adapter._health_check_task = None
 
         await adapter.disconnect()
 
