@@ -1010,7 +1010,20 @@ class DingTalkAdapter(BasePlatformAdapter):
         if not self._http_client:
             return SendResult(success=False, error="HTTP client not initialized")
 
-        # Download image bytes
+        # Session webhook image requires a public picURL, not a mediaId.
+        # Try it first with the original image_url before incurring an upload.
+        metadata = metadata or {}
+        session_webhook = metadata.get("session_webhook") or self._session_webhooks.get(chat_id)
+        if session_webhook:
+            result = await self._send_media_via_webhook(
+                chat_id, "image", {"picURL": image_url}, metadata
+            )
+            if result is not None:
+                if caption and result.success:
+                    await self.send(chat_id, caption, reply_to=reply_to, metadata=metadata)
+                return result
+
+        # No session webhook (or webhook not available) — download and upload for proactive API.
         try:
             resp = await self._http_client.get(image_url, timeout=30.0, follow_redirects=True)
             if resp.status_code >= 300:
@@ -1025,15 +1038,11 @@ class DingTalkAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_image: failed to download %s: %s", self.name, image_url[:80], e)
             return await self.send(chat_id, f"[Image]({image_url})" + (f"\n{caption}" if caption else ""), reply_to=reply_to, metadata=metadata)
 
-        # Upload to DingTalk
         media_id = await self._upload_media(image_bytes, "image", filename)
         if not media_id:
             return await self.send(chat_id, f"[Image]({image_url})" + (f"\n{caption}" if caption else ""), reply_to=reply_to, metadata=metadata)
 
-        # Prefer session webhook; fall back to proactive API.
-        result = await self._send_media_via_webhook(
-            chat_id, "image", {"mediaId": media_id}, metadata
-        ) or await self._send_media_proactive(chat_id, "sampleImageMsg", {"photoURL": media_id})
+        result = await self._send_media_proactive(chat_id, "sampleImageMsg", {"photoURL": media_id})
         if caption and result.success:
             await self.send(chat_id, caption, reply_to=reply_to, metadata=metadata)
         return result
@@ -1067,9 +1076,9 @@ class DingTalkAdapter(BasePlatformAdapter):
                 metadata=metadata,
             )
 
-        result = await self._send_media_via_webhook(
-            chat_id, "image", {"mediaId": media_id}, metadata
-        ) or await self._send_media_proactive(chat_id, "sampleImageMsg", {"photoURL": media_id})
+        # Session webhook image requires picURL (a public URL), which is unavailable
+        # for local files.  Use the proactive API directly.
+        result = await self._send_media_proactive(chat_id, "sampleImageMsg", {"photoURL": media_id})
         if caption and result.success:
             await self.send(chat_id, caption, reply_to=reply_to, metadata=metadata)
         return result

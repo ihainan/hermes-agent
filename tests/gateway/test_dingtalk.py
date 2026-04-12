@@ -1651,17 +1651,22 @@ class TestSendImage:
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
 
         adapter = self._make_adapter()
-        adapter._http_client.get = AsyncMock(return_value=self._ok_download_resp())
-        # upload → sampleImageMsg send → caption send (via session webhook)
+        # When session webhook is available, send_image sends picURL directly (no download/upload).
+        # Flow: webhook picURL image → caption follow-up (2 POSTs total).
         adapter._session_webhooks["cidGROUP1"] = "https://wh.example/hook"
         adapter._http_client.post = AsyncMock(
-            side_effect=[self._ok_upload_resp(), self._ok_send_resp(), self._ok_send_resp()]
+            side_effect=[self._ok_send_resp(), self._ok_send_resp()]
         )
 
         await adapter.send_image("cidGROUP1", "https://example.com/img.jpg", caption="My photo")
 
-        # Third call should be the caption follow-up via session webhook
-        assert adapter._http_client.post.call_count == 3
+        assert adapter._http_client.post.call_count == 2
+        # First call: image via picURL to session webhook
+        image_call = adapter._http_client.post.call_args_list[0]
+        image_payload = image_call[1]["json"]
+        assert image_payload["msgtype"] == "image"
+        assert image_payload["image"]["picURL"] == "https://example.com/img.jpg"
+        # Second call: caption follow-up via session webhook
         caption_call = adapter._http_client.post.call_args_list[-1]
         caption_payload = caption_call[1]["json"]
         assert "My photo" in caption_payload["markdown"]["text"]
@@ -1669,6 +1674,7 @@ class TestSendImage:
 
     @pytest.mark.asyncio
     async def test_falls_back_to_text_on_download_failure(self):
+        """Without a session webhook, download failure causes text-link fallback."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1676,38 +1682,38 @@ class TestSendImage:
         adapter = self._make_adapter()
         err_resp = MagicMock()
         err_resp.status_code = 404
-        # GET fails
+        # GET fails; no session webhook → proactive path → download → fails
         adapter._http_client.get = AsyncMock(return_value=err_resp)
-        # send() via webhook fallback succeeds
         ok_resp = MagicMock()
         ok_resp.status_code = 200
         ok_resp.text = ""
-        adapter._session_webhooks["cidGROUP1"] = "https://wh.example/hook"
         adapter._http_client.post = AsyncMock(return_value=ok_resp)
 
         result = await adapter.send_image("cidGROUP1", "https://example.com/img.jpg")
 
-        # Falls back → webhook send
+        # Falls back to text link via proactive API
         assert result.success is True
         fallback_payload = adapter._http_client.post.call_args[1]["json"]
-        assert "https://example.com/img.jpg" in fallback_payload["markdown"]["text"]
+        msg_param = json.loads(fallback_payload["msgParam"])
+        assert "https://example.com/img.jpg" in msg_param["text"]
         mod._TOKEN_CACHE.pop("bot-id", None)
 
     @pytest.mark.asyncio
     async def test_falls_back_to_text_on_upload_failure(self):
+        """Without a session webhook, upload failure causes text-link fallback."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
 
         adapter = self._make_adapter()
         adapter._http_client.get = AsyncMock(return_value=self._ok_download_resp())
+        # No session webhook → proactive path → upload fails → text fallback
         upload_err = MagicMock()
         upload_err.status_code = 500
         upload_err.text = "error"
         ok_resp = MagicMock()
         ok_resp.status_code = 200
         ok_resp.text = ""
-        adapter._session_webhooks["cidGROUP1"] = "https://wh.example/hook"
         adapter._http_client.post = AsyncMock(side_effect=[upload_err, ok_resp])
 
         result = await adapter.send_image("cidGROUP1", "https://example.com/img.jpg")
