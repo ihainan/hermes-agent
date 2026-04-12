@@ -7606,6 +7606,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         # Lower root logger level if needed so DEBUG records can reach the handler
         if _stderr_level < logging.getLogger().level:
             logging.getLogger().setLevel(_stderr_level)
+    elif os.getenv("JOURNAL_STREAM"):
+        # Running under systemd: stdout/stderr are captured by the journal.
+        # Emit INFO+ so that platform connect/disconnect events are visible in
+        # `journalctl -u hermes-gateway` without requiring -v on the unit.
+        _journal_handler = logging.StreamHandler()
+        _journal_handler.setLevel(logging.INFO)
+        _journal_handler.setFormatter(RedactingFormatter('%(levelname)s %(name)s: %(message)s'))
+        logging.getLogger().addHandler(_journal_handler)
 
     runner = GatewayRunner(config)
     

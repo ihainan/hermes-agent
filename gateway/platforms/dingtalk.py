@@ -103,12 +103,8 @@ _TOKEN_LOCKS: Dict[str, asyncio.Lock] = {}
 
 
 def check_dingtalk_requirements() -> bool:
-    """Check if DingTalk dependencies are available and configured."""
-    if not DINGTALK_STREAM_AVAILABLE or not HTTPX_AVAILABLE:
-        return False
-    if not os.getenv("DINGTALK_CLIENT_ID") or not os.getenv("DINGTALK_CLIENT_SECRET"):
-        return False
-    return True
+    """Check if DingTalk dependencies are available."""
+    return DINGTALK_STREAM_AVAILABLE and HTTPX_AVAILABLE
 
 
 class DingTalkAdapter(BasePlatformAdapter):

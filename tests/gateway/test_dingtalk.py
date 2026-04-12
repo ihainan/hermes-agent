@@ -24,7 +24,8 @@ class TestDingTalkRequirements:
             from gateway.platforms.dingtalk import check_dingtalk_requirements
             assert check_dingtalk_requirements() is False
 
-    def test_returns_false_when_env_vars_missing(self, monkeypatch):
+    def test_returns_true_when_libs_available_no_env_vars(self, monkeypatch):
+        # Credentials in config.yaml only (no env vars) must not block adapter creation.
         monkeypatch.setattr(
             "gateway.platforms.dingtalk.DINGTALK_STREAM_AVAILABLE", True
         )
@@ -32,15 +33,13 @@ class TestDingTalkRequirements:
         monkeypatch.delenv("DINGTALK_CLIENT_ID", raising=False)
         monkeypatch.delenv("DINGTALK_CLIENT_SECRET", raising=False)
         from gateway.platforms.dingtalk import check_dingtalk_requirements
-        assert check_dingtalk_requirements() is False
+        assert check_dingtalk_requirements() is True
 
     def test_returns_true_when_all_available(self, monkeypatch):
         monkeypatch.setattr(
             "gateway.platforms.dingtalk.DINGTALK_STREAM_AVAILABLE", True
         )
         monkeypatch.setattr("gateway.platforms.dingtalk.HTTPX_AVAILABLE", True)
-        monkeypatch.setenv("DINGTALK_CLIENT_ID", "test-id")
-        monkeypatch.setenv("DINGTALK_CLIENT_SECRET", "test-secret")
         from gateway.platforms.dingtalk import check_dingtalk_requirements
         assert check_dingtalk_requirements() is True
 
