@@ -364,6 +364,19 @@ PLATFORM_HINTS = {
         "documents. You can also include image URLs in markdown format ![alt](url) and they "
         "will be downloaded and sent as native media when possible."
     ),
+    "dingtalk": (
+        "You are on DingTalk (钉钉), a business messaging platform. "
+        "DingTalk renders a limited subset of markdown: **bold**, *italic*, "
+        "and [links](url) work; headings and tables render in most clients; "
+        "code blocks are partially supported. Avoid complex markdown that may "
+        "not render correctly. "
+        "You can send media files natively: include MEDIA:/absolute/path/to/file "
+        "in your response. Images (.jpg, .png) appear as photos, audio files "
+        "(.amr, .mp3) are sent as voice messages, videos (.mp4) play inline, "
+        "and other files arrive as downloadable attachments. "
+        "You can also include image URLs in markdown format ![alt](url) and "
+        "they will be sent as photos."
+    ),
 }
 
 # ---------------------------------------------------------------------------

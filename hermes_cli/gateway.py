@@ -24,8 +24,10 @@ from hermes_cli.config import (
     get_env_value,
     get_hermes_home,
     is_managed,
+    load_config,
     managed_error,
     read_raw_config,
+    save_config,
     save_env_value,
 )
 # display_hermes_home is imported lazily at call sites to avoid ImportError
@@ -2095,9 +2097,61 @@ def _setup_sms():
 
 
 def _setup_dingtalk():
-    """Configure DingTalk via the standard platform setup."""
-    dingtalk_platform = next(p for p in _PLATFORMS if p["key"] == "dingtalk")
-    _setup_standard_platform(dingtalk_platform)
+    """Configure DingTalk via interactive setup wizard."""
+    print()
+    print(color("  ─── 💬 DingTalk Setup ───", Colors.CYAN))
+
+    existing = get_env_value("DINGTALK_CLIENT_ID")
+    if existing:
+        print()
+        print_success("DingTalk is already configured.")
+        if not prompt_yes_no("  Reconfigure DingTalk?", False):
+            return
+
+    # Step 1: Credentials
+    print()
+    print_info("  1. Go to https://open-dev.dingtalk.com and create a robot application.")
+    print_info("  2. Under 'Credentials & Basic Info', copy your AppKey (Client ID)")
+    print_info("     and AppSecret (Client Secret).")
+    print()
+
+    client_id = prompt("  AppKey (Client ID)")
+    if not client_id:
+        return
+    save_env_value("DINGTALK_CLIENT_ID", client_id)
+
+    client_secret = prompt("  AppSecret (Client Secret)", password=True)
+    if not client_secret:
+        return
+    save_env_value("DINGTALK_CLIENT_SECRET", client_secret)
+    print_success("  DingTalk credentials saved.")
+
+    # Step 2: Access control
+    # DINGTALK_ALLOW_ALL_USERS=true delegates access control to DingTalk's
+    # App Availability Scope (应用可见范围) rather than an in-bot allowlist.
+    # Users can restrict access via the DingTalk Developer Console instead.
+    save_env_value("DINGTALK_ALLOW_ALL_USERS", "true")
+    print()
+    print_info("  Access control is delegated to DingTalk's App Availability Scope.")
+    print_info("  To restrict who can use the bot, publish a version in the DingTalk")
+    print_info("  Developer Console and set the appropriate scope.")
+
+    # Step 3: AI Card streaming (optional)
+    print()
+    if prompt_yes_no("  Configure AI Card streaming for live tool-call progress? (optional)", False):
+        print()
+        print_info("  Create a card template at https://open-dev.dingtalk.com/fe/card")
+        print_info("  and copy the Template ID below.")
+        print()
+        template_id = prompt("  Card Template ID")
+        if template_id:
+            template_key = prompt("  Content variable name in template", default="content") or "content"
+            cfg = load_config()
+            cfg.setdefault("platforms", {}).setdefault("dingtalk", {}).setdefault("extra", {})
+            cfg["platforms"]["dingtalk"]["extra"]["card_template_id"] = template_id
+            cfg["platforms"]["dingtalk"]["extra"]["card_template_key"] = template_key
+            save_config(cfg)
+            print_success("  AI Card configuration saved.")
 
 
 def _setup_feishu():
