@@ -300,6 +300,9 @@ class GatewayConfig:
                 config.extra.get("corp_id") or config.extra.get("apps")
             ):
                 connected.append(platform)
+            # DingTalk uses extra dict for app credentials
+            elif platform == Platform.DINGTALK and config.extra.get("client_id"):
+                connected.append(platform)
             # BlueBubbles uses extra dict for local server config
             elif platform == Platform.BLUEBUBBLES and config.extra.get("server_url") and config.extra.get("password"):
                 connected.append(platform)
@@ -1044,6 +1047,25 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             "host": os.getenv("WECOM_CALLBACK_HOST", "0.0.0.0"),
             "port": int(os.getenv("WECOM_CALLBACK_PORT", "8645")),
         })
+
+    # DingTalk
+    dingtalk_client_id = os.getenv("DINGTALK_CLIENT_ID")
+    dingtalk_client_secret = os.getenv("DINGTALK_CLIENT_SECRET")
+    if dingtalk_client_id and dingtalk_client_secret:
+        if Platform.DINGTALK not in config.platforms:
+            config.platforms[Platform.DINGTALK] = PlatformConfig()
+        config.platforms[Platform.DINGTALK].enabled = True
+        config.platforms[Platform.DINGTALK].extra.update({
+            "client_id": dingtalk_client_id,
+            "client_secret": dingtalk_client_secret,
+        })
+        dingtalk_home = os.getenv("DINGTALK_HOME_CHANNEL")
+        if dingtalk_home:
+            config.platforms[Platform.DINGTALK].home_channel = HomeChannel(
+                platform=Platform.DINGTALK,
+                chat_id=dingtalk_home,
+                name=os.getenv("DINGTALK_HOME_CHANNEL_NAME", "Home"),
+            )
 
     # Weixin (personal WeChat via iLink Bot API)
     weixin_token = os.getenv("WEIXIN_TOKEN")
