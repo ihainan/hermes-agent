@@ -25,7 +25,8 @@ import random
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+import re
+from typing import Any, Dict, Optional, Tuple
 
 try:
     import dingtalk_stream
@@ -131,6 +132,13 @@ class DingTalkAdapter(BasePlatformAdapter):
         # Proactive routing: chat type and user_id learned from inbound messages
         self._chat_types: Dict[str, str] = {}      # chat_id → "group" | "dm"
         self._dm_user_ids: Dict[str, str] = {}     # DM chat_id → sender_id
+
+        # AI card streaming for tool call progress display (issue #8060)
+        # Activated only when card_template_id is set in config.extra.
+        self._card_template_id: str = extra.get("card_template_id", "").strip()
+        self._card_template_key: str = (extra.get("card_template_key") or "content").strip()
+        # Active progress cards per chat: chat_id → (outTrackId, last_content)
+        self._progress_cards: Dict[str, Tuple[str, str]] = {}
 
         # Emoji reaction acknowledgment (issue #6)
         # Disable with config.extra.ack_reaction = "none"
@@ -353,8 +361,8 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         # Track chat type and DM user_id for proactive sends
         self._chat_types[chat_id] = chat_type
-        if chat_type == "dm" and sender_id:
-            self._dm_user_ids[chat_id] = sender_id
+        if chat_type == "dm" and (sender_staff_id or sender_id):
+            self._dm_user_ids[chat_id] = sender_staff_id or sender_id
 
         source = self.build_source(
             chat_id=chat_id,
@@ -772,6 +780,35 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         """
         metadata = metadata or {}
+
+        # Normalize single newlines to double newlines so DingTalk Markdown
+        # renders line breaks correctly (single \n is treated as a space).
+        content = re.sub(r'\n(?!\n)', '\n\n', content)
+
+        # Card mode: intercept the first progress send() so it creates a card
+        # instead of a regular text bubble.  run.py's send_progress_messages()
+        # always calls send() for the first tool line (to obtain a message_id),
+        # then calls edit_message() for subsequent updates.  By creating the card
+        # here we avoid the stray plain-text bubble that would otherwise appear.
+        if (self._card_template_id
+                and chat_id not in self._progress_cards
+                and self._looks_like_progress_content(content)):
+            out_track_id = await self._create_progress_card(
+                chat_id, self._format_progress_content(content)
+            )
+            if out_track_id:
+                self._progress_cards[chat_id] = (out_track_id, content)
+                return SendResult(success=True, message_id=out_track_id)
+            # Card creation failed — fall through to normal text send
+
+        # If there is an active progress card for this chat, finalize it before
+        # sending the final response so the card is marked done first.
+        _pending_card = self._progress_cards.pop(chat_id, None)
+        if _pending_card:
+            _card_track_id, _card_last_content = _pending_card
+            await self._finalize_progress_card(
+                _card_track_id, self._format_progress_content(_card_last_content)
+            )
 
         session_webhook = metadata.get("session_webhook") or self._session_webhooks.get(chat_id)
 
@@ -1267,6 +1304,197 @@ class DingTalkAdapter(BasePlatformAdapter):
         except Exception:
             pass
         return 0
+
+    # -- AI card streaming (issue #8060) ------------------------------------
+
+    # Matches a single tool-progress line: emoji(s) + space + ascii_tool_name + colon/dot
+    # Used to distinguish the first progress send() from a regular bot reply.
+    _PROGRESS_LINE_RE = re.compile(r'^\S{1,6}\s+[a-z_]\w*[:.].', re.UNICODE)
+
+    @staticmethod
+    def _looks_like_progress_content(content: str) -> bool:
+        """Return True if every non-empty line matches the tool-progress format."""
+        lines = [l.strip() for l in content.strip().split('\n') if l.strip()]
+        if not lines:
+            return False
+        return all(DingTalkAdapter._PROGRESS_LINE_RE.match(l) for l in lines)
+
+    @staticmethod
+    def _format_progress_content(content: str) -> str:
+        """Replace single newlines with double newlines for DingTalk Markdown rendering."""
+        return re.sub(r'\n(?!\n)', '\n\n', content)
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+    ) -> SendResult:
+        """Stream accumulated tool-call progress into a DingTalk AI card.
+
+        Called repeatedly by send_progress_messages() as tool events arrive.
+        First call creates the card; subsequent calls stream updated content.
+        Returns success=False when card_template_id is not configured so the
+        gateway's gate check disables progress display for this adapter.
+        """
+        if not self._card_template_id:
+            logger.info("[%s] edit_message: card_template_id not set, skipping", self.name)
+            return SendResult(success=False, error="Not supported")
+
+        logger.info("[%s] edit_message called: chat=%s card_exists=%s content=%r",
+                    self.name, chat_id[:20], chat_id in self._progress_cards, content[:60])
+
+        card_entry = self._progress_cards.get(chat_id)
+        if card_entry is None:
+            out_track_id = await self._create_progress_card(
+                chat_id, self._format_progress_content(content)
+            )
+            if out_track_id:
+                self._progress_cards[chat_id] = (out_track_id, content)
+                return SendResult(success=True, message_id=message_id)
+            logger.warning(
+                "[%s] Progress card creation failed for %s — progress will be silent",
+                self.name, chat_id[:20],
+            )
+            return SendResult(success=False, error="Card creation failed")
+
+        out_track_id, _ = card_entry
+        formatted = self._format_progress_content(content)
+        ok = await self._stream_progress_card(out_track_id, formatted, finalize=False)
+        if ok:
+            self._progress_cards[chat_id] = (out_track_id, content)
+        return SendResult(success=ok, message_id=message_id)
+
+    async def _create_progress_card(self, chat_id: str, content: str) -> Optional[str]:
+        """Create and deliver an AI card for streaming progress.
+
+        Calls POST /v1.0/card/instances/createAndDeliver.
+        Returns outTrackId on success, None on failure.
+        """
+        if not self._http_client:
+            return None
+
+        out_track_id = f"card_{uuid.uuid4().hex}"
+        is_group = self._chat_types.get(chat_id) == "group"
+        dm_user_id = self._dm_user_ids.get(chat_id, chat_id)
+        open_space_id = (
+            f"dtv1.card//IM_GROUP.{chat_id}" if is_group
+            else f"dtv1.card//im_robot.{dm_user_id}"
+        )
+
+        payload: Dict[str, Any] = {
+            "cardTemplateId": self._card_template_id,
+            "outTrackId": out_track_id,
+            "cardData": {
+                "cardParamMap": {
+                    "config": json.dumps({"autoLayout": True, "enableForward": True}),
+                    self._card_template_key: "",
+                }
+            },
+            "callbackType": "STREAM",
+            # Both space model fields are always included regardless of chat type
+            # (mirrors openclaw reference implementation).
+            "imGroupOpenSpaceModel": {"supportForward": True},
+            "imRobotOpenSpaceModel": {"supportForward": True},
+            "openSpaceId": open_space_id,
+            "userIdType": 1,
+        }
+
+        if is_group:
+            payload["imGroupOpenDeliverModel"] = {
+                "robotCode": self._client_id,
+                "extension": {"dynamicSummary": "true"},
+            }
+        else:
+            payload["imRobotOpenDeliverModel"] = {
+                "spaceType": "IM_ROBOT",
+                "robotCode": self._client_id,
+                "extension": {"dynamicSummary": "true"},
+            }
+
+        try:
+            headers = await self._dingtalk_headers()
+            resp = await self._http_client.post(
+                f"{_DINGTALK_API_BASE}/card/instances/createAndDeliver",
+                json=payload,
+                headers=headers,
+                timeout=10.0,
+            )
+            if resp.status_code < 300:
+                # Prefer the outTrackId returned by the server; fall back to ours.
+                resp_data = resp.json() if resp.text else {}
+                server_out_track_id = (
+                    (resp_data.get("result") or {}).get("outTrackId")
+                    or resp_data.get("outTrackId")
+                    or out_track_id
+                )
+                logger.info(
+                    "[%s] Progress card created: requested=%s server=%s body=%s",
+                    self.name, out_track_id, server_out_track_id, resp.text[:200],
+                )
+                out_track_id = server_out_track_id
+                # First PUT with empty content transitions PROCESSING → INPUTING.
+                # Without this activation step subsequent updates are ignored.
+                await self._stream_progress_card(out_track_id, "", finalize=False)
+                # Second PUT sets the actual initial content.
+                await self._stream_progress_card(out_track_id, content, finalize=False)
+                return out_track_id
+            logger.warning(
+                "[%s] Progress card creation HTTP %d: %s",
+                self.name, resp.status_code, resp.text[:200],
+            )
+            return None
+        except Exception as exc:
+            logger.warning("[%s] Progress card creation error: %s", self.name, exc)
+            return None
+
+    async def _stream_progress_card(
+        self, out_track_id: str, content: str, *, finalize: bool
+    ) -> bool:
+        """Send a streaming update to an AI card via PUT /v1.0/card/streaming.
+
+        content: full accumulated markdown (isFull=True, not a diff).
+        finalize: True on the last update — marks the card finished.
+        """
+        if not self._http_client:
+            return False
+
+        payload = {
+            "outTrackId": out_track_id,
+            "guid": uuid.uuid4().hex,
+            "key": self._card_template_key,
+            "content": content,
+            "isFull": True,
+            "isFinalize": finalize,
+            "isError": False,
+        }
+        try:
+            headers = await self._dingtalk_headers()
+            resp = await self._http_client.put(
+                f"{_DINGTALK_API_BASE}/card/streaming",
+                json=payload,
+                headers=headers,
+                timeout=10.0,
+            )
+            if resp.status_code < 300:
+                logger.info(
+                    "[%s] Card stream OK (%s) finalize=%s body=%s",
+                    self.name, out_track_id[:12], finalize, resp.text[:200],
+                )
+                return True
+            logger.warning(
+                "[%s] Card stream HTTP %d (%s): %s",
+                self.name, resp.status_code, out_track_id[:12], resp.text[:200],
+            )
+            return False
+        except Exception as exc:
+            logger.warning("[%s] Card stream error (%s): %s", self.name, out_track_id[:12], exc)
+            return False
+
+    async def _finalize_progress_card(self, out_track_id: str, last_content: str) -> None:
+        """Finalize a progress card with isFinalize=True, preserving last content. Non-fatal."""
+        await self._stream_progress_card(out_track_id, last_content, finalize=True)
+        logger.debug("[%s] Progress card finalized: %s", self.name, out_track_id)
 
     # -- Emoji reaction acknowledgment (issue #6) ---------------------------
 
