@@ -48,8 +48,10 @@ def token_adapter():
 
 
 class TestDingTalkRequirements:
+    """Tests for check_dingtalk_requirements() dependency and env-var validation."""
 
     def test_returns_false_when_sdk_missing(self, monkeypatch):
+        """Returns False when dingtalk-stream SDK is not installed."""
         with patch.dict("sys.modules", {"dingtalk_stream": None}):
             monkeypatch.setattr(
                 "gateway.platforms.dingtalk.DINGTALK_STREAM_AVAILABLE", False
@@ -58,6 +60,7 @@ class TestDingTalkRequirements:
             assert check_dingtalk_requirements() is False
 
     def test_returns_true_when_libs_available_no_env_vars(self, monkeypatch):
+        """Returns True when libraries are available even without env-var credentials."""
         # Credentials in config.yaml only (no env vars) must not block adapter creation.
         monkeypatch.setattr(
             "gateway.platforms.dingtalk.DINGTALK_STREAM_AVAILABLE", True
@@ -69,6 +72,7 @@ class TestDingTalkRequirements:
         assert check_dingtalk_requirements() is True
 
     def test_returns_true_when_all_available(self, monkeypatch):
+        """Returns True when all required libraries are present."""
         monkeypatch.setattr(
             "gateway.platforms.dingtalk.DINGTALK_STREAM_AVAILABLE", True
         )
@@ -83,8 +87,10 @@ class TestDingTalkRequirements:
 
 
 class TestDingTalkAdapterInit:
+    """Tests for DingTalkAdapter.__init__() configuration loading."""
 
     def test_reads_config_from_extra(self):
+        """Credentials and robot_code are read from PlatformConfig.extra."""
         from gateway.platforms.dingtalk import DingTalkAdapter
         config = PlatformConfig(
             enabled=True,
@@ -96,6 +102,7 @@ class TestDingTalkAdapterInit:
         assert adapter.name == "Dingtalk"  # base class uses .title()
 
     def test_falls_back_to_env_vars(self, monkeypatch):
+        """Falls back to DINGTALK_CLIENT_ID/SECRET env vars when extra is absent."""
         monkeypatch.setenv("DINGTALK_CLIENT_ID", "env-id")
         monkeypatch.setenv("DINGTALK_CLIENT_SECRET", "env-secret")
         from gateway.platforms.dingtalk import DingTalkAdapter
@@ -111,8 +118,10 @@ class TestDingTalkAdapterInit:
 
 
 class TestExtractText:
+    """Tests for DingTalkAdapter._extract_text() message text extraction."""
 
     def test_extracts_dict_text(self):
+        """Extracts and strips text from a dict payload with a 'content' key."""
         from gateway.platforms.dingtalk import DingTalkAdapter
         msg = MagicMock()
         msg.text = {"content": "  hello world  "}
@@ -120,6 +129,7 @@ class TestExtractText:
         assert DingTalkAdapter._extract_text(msg) == "hello world"
 
     def test_extracts_string_text(self):
+        """Returns the text directly when msg.text is a plain string."""
         from gateway.platforms.dingtalk import DingTalkAdapter
         msg = MagicMock()
         msg.text = "plain text"
@@ -127,6 +137,7 @@ class TestExtractText:
         assert DingTalkAdapter._extract_text(msg) == "plain text"
 
     def test_falls_back_to_rich_text(self):
+        """Concatenates text parts from rich_text when msg.text is empty."""
         from gateway.platforms.dingtalk import DingTalkAdapter
         msg = MagicMock()
         msg.text = ""
@@ -134,6 +145,7 @@ class TestExtractText:
         assert DingTalkAdapter._extract_text(msg) == "part1 part2"
 
     def test_returns_empty_for_no_content(self):
+        """Returns empty string when both text and rich_text are absent."""
         from gateway.platforms.dingtalk import DingTalkAdapter
         msg = MagicMock()
         msg.text = ""
@@ -147,19 +159,24 @@ class TestExtractText:
 
 
 class TestDeduplication:
+    """Tests for _is_duplicate() message deduplication cache."""
 
     def test_first_message_not_duplicate(self, adapter):
+        """First occurrence of a message ID is not a duplicate."""
         assert adapter._is_duplicate("msg-1") is False
 
     def test_second_same_message_is_duplicate(self, adapter):
+        """Second occurrence of the same message ID is detected as a duplicate."""
         adapter._is_duplicate("msg-1")
         assert adapter._is_duplicate("msg-1") is True
 
     def test_different_messages_not_duplicate(self, adapter):
+        """Different message IDs are never considered duplicates of each other."""
         adapter._is_duplicate("msg-1")
         assert adapter._is_duplicate("msg-2") is False
 
     def test_cache_cleanup_on_overflow(self, adapter):
+        """Cache is pruned when the seen-messages set overflows DEDUP_MAX_SIZE."""
         from gateway.platforms.dingtalk import DEDUP_MAX_SIZE
         # Fill beyond max
         for i in range(DEDUP_MAX_SIZE + 10):
@@ -174,9 +191,11 @@ class TestDeduplication:
 
 
 class TestSend:
+    """Tests for send() — session-webhook path, HTTP error handling, and caching."""
 
     @pytest.mark.asyncio
     async def test_send_posts_to_webhook(self):
+        """send() posts a markdown message to the session_webhook URL."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE[""] = ("tok", _time.time() + 3600)
@@ -228,6 +247,7 @@ class TestSend:
 
     @pytest.mark.asyncio
     async def test_send_uses_cached_webhook(self):
+        """send() uses a webhook already stored in _session_webhooks without a metadata arg."""
         from gateway.platforms.dingtalk import DingTalkAdapter
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
 
@@ -244,6 +264,7 @@ class TestSend:
 
     @pytest.mark.asyncio
     async def test_send_handles_http_error(self):
+        """send() returns a failure result with the HTTP status code in the error message."""
         from gateway.platforms.dingtalk import DingTalkAdapter
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
 
@@ -268,9 +289,11 @@ class TestSend:
 
 
 class TestConnect:
+    """Tests for connect() and disconnect() lifecycle methods."""
 
     @pytest.mark.asyncio
     async def test_connect_fails_without_sdk(self, adapter, monkeypatch):
+        """connect() returns False when the dingtalk-stream SDK is unavailable."""
         monkeypatch.setattr(
             "gateway.platforms.dingtalk.DINGTALK_STREAM_AVAILABLE", False
         )
@@ -279,6 +302,7 @@ class TestConnect:
 
     @pytest.mark.asyncio
     async def test_connect_fails_without_credentials(self, adapter):
+        """connect() returns False when client_id and client_secret are both empty."""
         adapter._client_id = ""
         adapter._client_secret = ""
         result = await adapter.connect()
@@ -286,6 +310,7 @@ class TestConnect:
 
     @pytest.mark.asyncio
     async def test_disconnect_cleans_up(self, adapter):
+        """disconnect() clears session webhooks, dedup cache, and HTTP client."""
         adapter._session_webhooks["a"] = "http://x"
         adapter._seen_messages["b"] = 1.0
         adapter._http_client = AsyncMock()
@@ -322,6 +347,7 @@ class TestProactiveMessaging:
 
     @pytest.mark.asyncio
     async def test_send_prefers_session_webhook(self, full_adapter):
+        """send() posts to the cached session webhook rather than the proactive API."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -341,6 +367,7 @@ class TestProactiveMessaging:
 
     @pytest.mark.asyncio
     async def test_send_proactive_group_when_no_webhook(self, full_adapter):
+        """send() falls back to the group proactive API when no session webhook is available."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -357,6 +384,7 @@ class TestProactiveMessaging:
 
     @pytest.mark.asyncio
     async def test_send_proactive_group_payload_format(self, full_adapter):
+        """Proactive group message payload uses sampleMarkdown with robotCode and openConversationId."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -377,6 +405,7 @@ class TestProactiveMessaging:
 
     @pytest.mark.asyncio
     async def test_send_proactive_uses_token_header(self, full_adapter):
+        """Proactive API calls carry the access token in x-acs-dingtalk-access-token header."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("mytoken123", _time.time() + 3600)
@@ -394,6 +423,7 @@ class TestProactiveMessaging:
 
     @pytest.mark.asyncio
     async def test_send_proactive_dm_when_no_webhook(self, full_adapter):
+        """send() falls back to the DM proactive API when _dm_user_ids has an entry."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -411,6 +441,7 @@ class TestProactiveMessaging:
 
     @pytest.mark.asyncio
     async def test_send_proactive_dm_payload_format(self, full_adapter):
+        """Proactive DM payload uses userIds list and omits openConversationId."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -465,6 +496,7 @@ class TestProactiveMessaging:
 
     @pytest.mark.asyncio
     async def test_send_chunks_long_message(self, full_adapter):
+        """Messages exceeding 3800 characters are split into multiple API calls."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -483,6 +515,7 @@ class TestProactiveMessaging:
 
     @pytest.mark.asyncio
     async def test_send_proactive_returns_failure_on_http_error(self, full_adapter):
+        """Proactive send returns a failure result when the API responds with a non-200 status."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -503,6 +536,7 @@ class TestProactiveMessaging:
 
 
 class TestGetAccessToken:
+    """Tests for _get_access_token() OAuth token fetching, caching, and retry logic."""
 
     def _ok_response(self, token="tok123", expire_in=7200):
         resp = MagicMock()
@@ -512,6 +546,7 @@ class TestGetAccessToken:
 
     @pytest.mark.asyncio
     async def test_fetches_token_on_first_call(self, token_adapter):
+        """Fetches a fresh token via HTTP on the first call when cache is empty."""
         import gateway.platforms.dingtalk as mod
         mod._TOKEN_CACHE.pop("test-id", None)
         mod._TOKEN_LOCKS.pop("test-id", None)
@@ -525,6 +560,7 @@ class TestGetAccessToken:
 
     @pytest.mark.asyncio
     async def test_cache_hit_skips_http(self, token_adapter):
+        """Token is returned from cache without an HTTP request when still valid."""
         import time
         import gateway.platforms.dingtalk as mod
 
@@ -543,6 +579,7 @@ class TestGetAccessToken:
 
     @pytest.mark.asyncio
     async def test_near_expiry_triggers_refresh(self, token_adapter):
+        """Token within the 60-second expiry buffer triggers a proactive refresh."""
         import time
         import gateway.platforms.dingtalk as mod
 
@@ -561,6 +598,7 @@ class TestGetAccessToken:
 
     @pytest.mark.asyncio
     async def test_retries_on_5xx_then_succeeds(self, token_adapter):
+        """Retries on 5xx errors and returns the token when a subsequent attempt succeeds."""
         import gateway.platforms.dingtalk as mod
         mod._TOKEN_CACHE.pop("test-id", None)
         mod._TOKEN_LOCKS.pop("test-id", None)
@@ -582,6 +620,7 @@ class TestGetAccessToken:
 
     @pytest.mark.asyncio
     async def test_raises_on_non_retryable_4xx(self, token_adapter):
+        """Raises RuntimeError immediately on a 4xx response without retrying."""
         import gateway.platforms.dingtalk as mod
         mod._TOKEN_CACHE.pop("test-id", None)
         mod._TOKEN_LOCKS.pop("test-id", None)
@@ -601,6 +640,7 @@ class TestGetAccessToken:
 
     @pytest.mark.asyncio
     async def test_raises_after_all_retries_exhausted(self, token_adapter):
+        """Raises RuntimeError after all retry attempts fail with 5xx errors."""
         import gateway.platforms.dingtalk as mod
         mod._TOKEN_CACHE.pop("test-id", None)
         mod._TOKEN_LOCKS.pop("test-id", None)
@@ -620,6 +660,7 @@ class TestGetAccessToken:
 
     @pytest.mark.asyncio
     async def test_dingtalk_headers_returns_token_header(self, token_adapter):
+        """_dingtalk_headers() returns a dict with the access-token and Content-Type headers."""
         import gateway.platforms.dingtalk as mod
         import time
         mod._TOKEN_CACHE["test-id"] = ("hdr-tok", time.time() + 3600)
@@ -640,6 +681,7 @@ class TestGetAccessToken:
 
 
 class TestHealthCheckAndReconnection:
+    """Tests for _run_stream() reconnection logic: backoff, jitter, and failure tracking."""
 
     @pytest.mark.asyncio
     async def test_last_message_at_updated_on_message(self, full_adapter):
@@ -782,6 +824,7 @@ class TestHealthCheckAndReconnection:
 
 
 class TestExtractQuotedContext:
+    """Tests for _extract_quoted_context() — quoted/replied message parsing."""
 
     def _make_msg(self, text_payload):
         msg = MagicMock()
@@ -789,6 +832,7 @@ class TestExtractQuotedContext:
         return msg
 
     def test_returns_none_for_plain_message(self):
+        """Returns (None, None) for a non-reply message with isReplyMsg=False."""
         from gateway.platforms.dingtalk import DingTalkAdapter
         msg = self._make_msg({"content": "hello", "isReplyMsg": False})
         text, msg_id = DingTalkAdapter._extract_quoted_context(msg)
@@ -796,6 +840,7 @@ class TestExtractQuotedContext:
         assert msg_id is None
 
     def test_returns_none_when_not_dict(self):
+        """Returns (None, None) when msg.text is a plain string, not a dict."""
         from gateway.platforms.dingtalk import DingTalkAdapter
         msg = self._make_msg("plain string text")
         text, msg_id = DingTalkAdapter._extract_quoted_context(msg)
@@ -851,6 +896,7 @@ class TestExtractQuotedContext:
         assert text == "preferred value"
 
     def test_graceful_when_replied_msg_absent(self):
+        """Returns (None, None) gracefully when repliedMsg key is missing entirely."""
         from gateway.platforms.dingtalk import DingTalkAdapter
         msg = self._make_msg({"content": "reply", "isReplyMsg": True})
         text, msg_id = DingTalkAdapter._extract_quoted_context(msg)
@@ -858,6 +904,7 @@ class TestExtractQuotedContext:
         assert msg_id is None
 
     def test_graceful_when_replied_msg_not_dict(self):
+        """Returns (None, None) gracefully when repliedMsg is not a dict."""
         from gateway.platforms.dingtalk import DingTalkAdapter
         msg = self._make_msg({
             "content": "reply",
@@ -869,6 +916,7 @@ class TestExtractQuotedContext:
         assert msg_id is None
 
     def test_returns_none_when_msg_content_empty_no_type(self):
+        """Returns (None, None) when msgContent is blank and msgType is absent."""
         from gateway.platforms.dingtalk import DingTalkAdapter
         msg = self._make_msg({
             "content": "reply",
@@ -885,6 +933,7 @@ class TestExtractQuotedContext:
         ("file",    "<media:file>"),
     ])
     def test_media_type_returns_placeholder(self, msg_type, expected_placeholder):
+        """Media message types (picture/audio/video/file) return a typed placeholder string."""
         from gateway.platforms.dingtalk import DingTalkAdapter
         msg = self._make_msg({
             "content": "my reply",
@@ -950,6 +999,7 @@ class TestQuotedContextInjection:
 
     @pytest.mark.asyncio
     async def test_reply_to_fields_set_on_event(self, full_adapter):
+        """reply_to_text and reply_to_message_id are populated on the MessageEvent."""
         adapter = full_adapter
         captured = []
 
@@ -971,6 +1021,7 @@ class TestQuotedContextInjection:
 
     @pytest.mark.asyncio
     async def test_context_block_prepended_with_sender(self, full_adapter):
+        """event.text is prefixed with '[Replying to <sender>: "<quoted>"]' when sender is known."""
         adapter = full_adapter
         captured = []
 
@@ -991,6 +1042,7 @@ class TestQuotedContextInjection:
 
     @pytest.mark.asyncio
     async def test_context_block_without_sender_name(self, full_adapter):
+        """Prefix omits the sender name when msgSenderNick is absent from repliedMsg."""
         adapter = full_adapter
         captured = []
 
@@ -1010,6 +1062,7 @@ class TestQuotedContextInjection:
 
     @pytest.mark.asyncio
     async def test_no_prefix_for_plain_message(self, full_adapter):
+        """Plain (non-reply) messages are forwarded unchanged with no reply_to fields."""
         adapter = full_adapter
         captured = []
 
@@ -1075,6 +1128,7 @@ class TestParseInboundMessage:
 
     @pytest.mark.asyncio
     async def test_text_message_returns_text(self, full_adapter):
+        """Plain text messages are parsed into text content with MessageType.text."""
         adapter = full_adapter
         msg = self._make_msg("text", text={"content": "hello"})
         text, msg_type, media_urls, media_types = await adapter._parse_inbound_message(msg)
@@ -1086,6 +1140,7 @@ class TestParseInboundMessage:
 
     @pytest.mark.asyncio
     async def test_picture_downloads_and_caches(self, full_adapter):
+        """Picture messages are downloaded, cached locally, and returned as photo type."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1111,6 +1166,7 @@ class TestParseInboundMessage:
 
     @pytest.mark.asyncio
     async def test_picture_falls_back_on_download_failure(self, full_adapter):
+        """Photo type is still returned with empty media_urls when the download fails."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1135,6 +1191,7 @@ class TestParseInboundMessage:
 
     @pytest.mark.asyncio
     async def test_audio_message_type(self, full_adapter):
+        """Audio messages are downloaded and returned with MessageType.voice."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1156,6 +1213,7 @@ class TestParseInboundMessage:
 
     @pytest.mark.asyncio
     async def test_file_message_type(self, full_adapter):
+        """File messages are downloaded and returned with MessageType.document and filename as text."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1180,6 +1238,7 @@ class TestParseInboundMessage:
 
     @pytest.mark.asyncio
     async def test_video_message_type(self, full_adapter):
+        """Video messages are downloaded and returned with MessageType.video."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1202,6 +1261,7 @@ class TestParseInboundMessage:
 
     @pytest.mark.asyncio
     async def test_rich_text_concatenates_text_parts(self, full_adapter):
+        """richText messages with multiple text items are concatenated into a single string."""
         adapter = full_adapter
         msg = self._make_msg("richText")
         # Simulate SDK RichTextContent object with rich_text_list
@@ -1218,6 +1278,7 @@ class TestParseInboundMessage:
 
     @pytest.mark.asyncio
     async def test_rich_text_with_inline_image(self, full_adapter):
+        """richText with an inline picture item downloads the image and sets photo type."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1246,6 +1307,7 @@ class TestParseInboundMessage:
 
     @pytest.mark.asyncio
     async def test_download_media_returns_none_without_http_client(self):
+        """_download_media() returns (None, None) immediately when no HTTP client is set."""
         from gateway.platforms.dingtalk import DingTalkAdapter
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
         adapter._http_client = None
@@ -1254,6 +1316,7 @@ class TestParseInboundMessage:
 
     @pytest.mark.asyncio
     async def test_download_media_returns_none_on_missing_download_url(self, full_adapter):
+        """_download_media() returns (None, None) when the API response lacks a downloadUrl."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1278,6 +1341,7 @@ class TestBuildMultipart:
     """Tests for _build_multipart() — multipart/form-data body construction."""
 
     def test_returns_bytes_and_boundary(self, full_adapter):
+        """Returns a (bytes, str) tuple with non-empty body and boundary."""
         adapter = full_adapter
         body, boundary = adapter._build_multipart(b"data", "photo.jpg")
         assert isinstance(body, bytes)
@@ -1285,39 +1349,46 @@ class TestBuildMultipart:
         assert len(boundary) > 0
 
     def test_boundary_appears_in_body(self, full_adapter):
+        """The boundary string is embedded in the multipart body."""
         adapter = full_adapter
         body, boundary = adapter._build_multipart(b"data", "photo.jpg")
         assert boundary.encode() in body
 
     def test_media_field_name_present(self, full_adapter):
+        """Body contains a form field named 'media' as required by the oapi upload endpoint."""
         # oapi endpoint expects a single 'media' field; robotCode/mediaType go in URL.
         adapter = full_adapter
         body, _ = adapter._build_multipart(b"data", "photo.jpg")
         assert b'name="media"' in body
 
     def test_filename_in_content_disposition(self, full_adapter):
+        """Filename appears in the Content-Disposition header of the media part."""
         # filename must appear in Content-Disposition; it is NOT a separate form field.
         adapter = full_adapter
         body, _ = adapter._build_multipart(b"data", "audio.amr")
         assert b"audio.amr" in body
 
     def test_filename_field_present(self, full_adapter):
+        """Filename is present in the multipart body."""
         adapter = full_adapter
         body, _ = adapter._build_multipart(b"data", "report.pdf")
         assert b"report.pdf" in body
 
     def test_binary_data_embedded(self, full_adapter):
+        """Raw binary payload bytes are preserved verbatim in the body."""
         adapter = full_adapter
         payload = b"\x00\x01\x02\x03binary"
         body, _ = adapter._build_multipart(payload, "img.png")
         assert payload in body
 
     def test_body_ends_with_closing_boundary(self, full_adapter):
+        """Multipart body ends with the closing boundary delimiter."""
         adapter = full_adapter
         body, boundary = adapter._build_multipart(b"x", "x.jpg")
         assert body.endswith(f"--{boundary}--\r\n".encode())
 
     def test_each_call_produces_unique_boundary(self, full_adapter):
+        """Each _build_multipart call generates a unique boundary string."""
         adapter = full_adapter
         _, b1 = adapter._build_multipart(b"x", "a.jpg")
         _, b2 = adapter._build_multipart(b"x", "a.jpg")
@@ -1342,6 +1413,7 @@ class TestUploadMedia:
 
     @pytest.mark.asyncio
     async def test_returns_media_id_on_success(self, full_adapter):
+        """Returns (media_id, None) on a successful upload response."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1356,6 +1428,7 @@ class TestUploadMedia:
 
     @pytest.mark.asyncio
     async def test_posts_to_upload_endpoint(self, full_adapter):
+        """Posts to oapi.dingtalk.com/media/upload with the correct URL."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1371,6 +1444,7 @@ class TestUploadMedia:
 
     @pytest.mark.asyncio
     async def test_sets_multipart_content_type_header(self, full_adapter):
+        """Upload request includes a multipart/form-data Content-Type header with boundary."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1386,6 +1460,7 @@ class TestUploadMedia:
 
     @pytest.mark.asyncio
     async def test_returns_none_on_http_error(self, full_adapter):
+        """Returns (None, error_str) when the upload API responds with a non-200 status."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1400,6 +1475,7 @@ class TestUploadMedia:
 
     @pytest.mark.asyncio
     async def test_returns_none_when_media_id_missing_in_response(self, full_adapter):
+        """Returns (None, error_str) when the 200 response body lacks a media_id field."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1418,6 +1494,7 @@ class TestUploadMedia:
 
     @pytest.mark.asyncio
     async def test_returns_none_without_http_client(self):
+        """Returns (None, error_str) immediately when no HTTP client is configured."""
         from gateway.platforms.dingtalk import DingTalkAdapter
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
         adapter._http_client = None
@@ -1427,6 +1504,7 @@ class TestUploadMedia:
 
     @pytest.mark.asyncio
     async def test_returns_none_on_token_error(self, full_adapter):
+        """Returns (None, error_str) when token acquisition fails before the upload."""
         import gateway.platforms.dingtalk as mod
         mod._TOKEN_CACHE.pop("bot-id", None)
         mod._TOKEN_LOCKS.pop("bot-id", None)
@@ -1469,6 +1547,7 @@ class TestSendMediaProactive:
 
     @pytest.mark.asyncio
     async def test_routes_to_group_endpoint(self):
+        """Routes to the groupMessages/send endpoint for group chat IDs."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1484,6 +1563,7 @@ class TestSendMediaProactive:
 
     @pytest.mark.asyncio
     async def test_routes_to_dm_endpoint(self):
+        """Routes to the oToMessages/batchSend endpoint for DM chat IDs."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1501,6 +1581,7 @@ class TestSendMediaProactive:
 
     @pytest.mark.asyncio
     async def test_payload_includes_msg_key_and_param(self):
+        """Payload contains msgKey and JSON-serialised msgParam with the provided fields."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1519,6 +1600,7 @@ class TestSendMediaProactive:
 
     @pytest.mark.asyncio
     async def test_returns_success_with_message_id(self):
+        """Returns a successful SendResult with a non-None message_id on HTTP 200."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1534,6 +1616,7 @@ class TestSendMediaProactive:
 
     @pytest.mark.asyncio
     async def test_returns_failure_on_http_error(self):
+        """Returns a failure SendResult with the status code in the error when API fails."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1549,6 +1632,7 @@ class TestSendMediaProactive:
 
     @pytest.mark.asyncio
     async def test_returns_failure_without_http_client(self):
+        """Returns a failure SendResult immediately when no HTTP client is set."""
         from gateway.platforms.dingtalk import DingTalkAdapter
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
         adapter._http_client = None
@@ -1593,11 +1677,13 @@ class TestGetAudioDuration:
     """Tests for _get_audio_duration_ms() — returns milliseconds, soft mutagen dependency."""
 
     def test_returns_zero_when_mutagen_unavailable(self, monkeypatch):
+        """Returns 0 when the mutagen library is not installed."""
         monkeypatch.setattr("gateway.platforms.dingtalk.MUTAGEN_AVAILABLE", False)
         from gateway.platforms.dingtalk import DingTalkAdapter
         assert DingTalkAdapter._get_audio_duration_ms("/any/path.mp3") == 0
 
     def test_returns_zero_when_mutagen_returns_none(self, monkeypatch):
+        """Returns 0 when mutagen.File() cannot parse the audio file."""
         monkeypatch.setattr("gateway.platforms.dingtalk.MUTAGEN_AVAILABLE", True)
         mock_mutagen = MagicMock()
         mock_mutagen.File.return_value = None
@@ -1606,6 +1692,7 @@ class TestGetAudioDuration:
         assert DingTalkAdapter._get_audio_duration_ms("/any/path.mp3") == 0
 
     def test_returns_duration_ms_from_mutagen(self, monkeypatch):
+        """Converts mutagen info.length (seconds) to integer milliseconds."""
         monkeypatch.setattr("gateway.platforms.dingtalk.MUTAGEN_AVAILABLE", True)
         mock_audio = MagicMock()
         mock_audio.info.length = 42.7
@@ -1616,6 +1703,7 @@ class TestGetAudioDuration:
         assert DingTalkAdapter._get_audio_duration_ms("/any/path.mp3") == 42700
 
     def test_returns_at_least_one_for_sub_second_audio(self, monkeypatch):
+        """Sub-second audio clips return their actual millisecond duration (not clamped to 1)."""
         monkeypatch.setattr("gateway.platforms.dingtalk.MUTAGEN_AVAILABLE", True)
         mock_audio = MagicMock()
         mock_audio.info.length = 0.3
@@ -1626,6 +1714,7 @@ class TestGetAudioDuration:
         assert DingTalkAdapter._get_audio_duration_ms("/any/path.mp3") == 300
 
     def test_returns_zero_on_mutagen_exception(self, monkeypatch):
+        """Returns 0 without raising when mutagen throws an exception."""
         monkeypatch.setattr("gateway.platforms.dingtalk.MUTAGEN_AVAILABLE", True)
         mock_mutagen = MagicMock()
         mock_mutagen.File.side_effect = Exception("parse error")
@@ -1660,6 +1749,7 @@ class TestSendImage:
 
     @pytest.mark.asyncio
     async def test_sends_sampleImageMsg_on_success(self, full_adapter):
+        """Uploads image and sends a sampleImageMsg with the resulting media_id."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1681,6 +1771,7 @@ class TestSendImage:
 
     @pytest.mark.asyncio
     async def test_sends_caption_as_followup_message(self, full_adapter):
+        """Caption is sent as a separate follow-up markdown message after the image."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1758,6 +1849,7 @@ class TestSendImage:
 
     @pytest.mark.asyncio
     async def test_returns_failure_without_http_client(self):
+        """Returns a failure SendResult immediately when no HTTP client is set."""
         from gateway.platforms.dingtalk import DingTalkAdapter
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
         adapter._http_client = None
@@ -1766,6 +1858,7 @@ class TestSendImage:
 
     @pytest.mark.asyncio
     async def test_infers_extension_from_content_type(self, full_adapter):
+        """File extension for upload is inferred from the Content-Type response header."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1795,6 +1888,7 @@ class TestSendVoice:
 
     @pytest.mark.asyncio
     async def test_sends_audio_template(self, full_adapter, tmp_path):
+        """Uploads the audio file and sends a sampleAudio message with mediaId and duration."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1824,6 +1918,7 @@ class TestSendVoice:
 
     @pytest.mark.asyncio
     async def test_falls_back_to_text_on_upload_failure(self, full_adapter, tmp_path):
+        """Falls back to a text message with the filename when audio upload fails."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1850,6 +1945,7 @@ class TestSendVoice:
 
     @pytest.mark.asyncio
     async def test_returns_failure_on_unreadable_file(self, full_adapter):
+        """Returns a failure SendResult with 'Cannot read audio file' when path is invalid."""
         adapter = full_adapter
         result = await adapter.send_voice("cidGROUP1", "/nonexistent/path/audio.amr")
         assert result.success is False
@@ -1857,6 +1953,7 @@ class TestSendVoice:
 
     @pytest.mark.asyncio
     async def test_duration_zero_when_mutagen_unavailable(self, full_adapter, tmp_path, monkeypatch):
+        """msgParam duration is '0' when mutagen is unavailable to read the audio length."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1888,6 +1985,7 @@ class TestSendDocument:
 
     @pytest.mark.asyncio
     async def test_sends_file_template(self, full_adapter, tmp_path):
+        """Uploads the file and sends a sampleFile message with mediaId, fileName, and fileType."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1918,6 +2016,7 @@ class TestSendDocument:
 
     @pytest.mark.asyncio
     async def test_uses_custom_file_name(self, full_adapter, tmp_path):
+        """file_name override is used for fileName and fileType in the message payload."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1945,6 +2044,7 @@ class TestSendDocument:
 
     @pytest.mark.asyncio
     async def test_returns_failure_on_unreadable_file(self, full_adapter):
+        """Returns a failure SendResult with 'Cannot read file' when the path is invalid."""
         adapter = full_adapter
         result = await adapter.send_document("cidGROUP1", "/nonexistent/doc.pdf")
         assert result.success is False
@@ -1952,6 +2052,7 @@ class TestSendDocument:
 
     @pytest.mark.asyncio
     async def test_falls_back_to_text_on_upload_failure(self, full_adapter, tmp_path):
+        """Falls back to a text message with the filename when document upload fails."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -1982,6 +2083,7 @@ class TestSendVideo:
 
     @pytest.mark.asyncio
     async def test_sends_video_template(self, full_adapter, tmp_path):
+        """Uploads the video and sends a sampleFile message (no thumbnail available)."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -2013,6 +2115,7 @@ class TestSendVideo:
 
     @pytest.mark.asyncio
     async def test_video_size_matches_file_content(self, full_adapter, tmp_path):
+        """Payload fileName and fileType reflect the actual video file written to disk."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -2042,6 +2145,7 @@ class TestSendVideo:
 
     @pytest.mark.asyncio
     async def test_returns_failure_on_unreadable_file(self, full_adapter):
+        """Returns a failure SendResult with 'Cannot read video file' for a missing path."""
         adapter = full_adapter
         result = await adapter.send_video("cidGROUP1", "/nonexistent/video.mp4")
         assert result.success is False
@@ -2049,6 +2153,7 @@ class TestSendVideo:
 
     @pytest.mark.asyncio
     async def test_falls_back_to_text_on_upload_failure(self, full_adapter, tmp_path):
+        """Falls back to a text message with the filename when video upload fails."""
         import gateway.platforms.dingtalk as mod
         import time as _time
         mod._TOKEN_CACHE["bot-id"] = ("tok", _time.time() + 3600)
@@ -2075,8 +2180,10 @@ class TestSendVideo:
 
 
 class TestPlatformEnum:
+    """Tests that DingTalk is registered in the Platform enum."""
 
     def test_dingtalk_in_platform_enum(self):
+        """Platform.DINGTALK has value 'dingtalk'."""
         assert Platform.DINGTALK.value == "dingtalk"
 
 
@@ -2099,6 +2206,7 @@ class TestReactionHelpers:
 
     @pytest.mark.asyncio
     async def test_add_reaction_posts_to_emotion_reply(self, full_adapter):
+        """_add_reaction() posts to robot/emotion/reply with the correct message and chat IDs."""
         self._token()
         adapter = full_adapter
         ok = MagicMock()
@@ -2118,6 +2226,7 @@ class TestReactionHelpers:
 
     @pytest.mark.asyncio
     async def test_add_reaction_is_noop_without_http_client(self):
+        """_add_reaction() does nothing silently when no HTTP client is set."""
         from gateway.platforms.dingtalk import DingTalkAdapter
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
         adapter._http_client = None
@@ -2126,6 +2235,7 @@ class TestReactionHelpers:
 
     @pytest.mark.asyncio
     async def test_add_reaction_ignores_api_error(self, full_adapter):
+        """_add_reaction() swallows exceptions from the API without propagating them."""
         self._token()
         adapter = full_adapter
         adapter._http_client.post = AsyncMock(side_effect=Exception("network error"))
@@ -2138,11 +2248,13 @@ class TestReactionAckConfig:
     """Tests for the ack_reaction config option."""
 
     def test_reactions_enabled_by_default(self):
+        """ack_reaction defaults to enabled when the config option is absent."""
         from gateway.platforms.dingtalk import DingTalkAdapter
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
         assert adapter._ack_reaction_enabled is True
 
     def test_reactions_disabled_via_config(self):
+        """ack_reaction='none' disables the reaction ACK."""
         from gateway.platforms.dingtalk import DingTalkAdapter
         adapter = DingTalkAdapter(
             PlatformConfig(enabled=True, extra={"ack_reaction": "none"})
@@ -2150,6 +2262,7 @@ class TestReactionAckConfig:
         assert adapter._ack_reaction_enabled is False
 
     def test_reactions_enabled_explicitly(self):
+        """ack_reaction='emoji' explicitly enables the reaction ACK."""
         from gateway.platforms.dingtalk import DingTalkAdapter
         adapter = DingTalkAdapter(
             PlatformConfig(enabled=True, extra={"ack_reaction": "emoji"})
@@ -2157,6 +2270,7 @@ class TestReactionAckConfig:
         assert adapter._ack_reaction_enabled is True
 
     def test_reactions_disabled_case_insensitive(self):
+        """ack_reaction='None' (case-insensitive, with whitespace) also disables the ACK."""
         from gateway.platforms.dingtalk import DingTalkAdapter
         adapter = DingTalkAdapter(
             PlatformConfig(enabled=True, extra={"ack_reaction": "  None  "})
