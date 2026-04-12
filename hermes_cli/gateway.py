@@ -2097,61 +2097,79 @@ def _setup_sms():
 
 
 def _setup_dingtalk():
-    """Configure DingTalk via interactive setup wizard."""
-    print()
-    print(color("  ─── 💬 DingTalk Setup ───", Colors.CYAN))
-
+    """Configure DingTalk robot credentials and optional AI Card streaming."""
+    print_header("DingTalk")
     existing = get_env_value("DINGTALK_CLIENT_ID")
     if existing:
-        print()
-        print_success("DingTalk is already configured.")
-        if not prompt_yes_no("  Reconfigure DingTalk?", False):
+        print_info("DingTalk: already configured")
+        if not prompt_yes_no("Reconfigure DingTalk?", False):
             return
 
-    # Step 1: Credentials
+    print_info("Step 1: Create your DingTalk robot app (创建机器人应用)")
+    print_info("")
+    print_info("   1. Go to https://open-dev.dingtalk.com/fe/app")
+    print_info("   2. At the top of the page, click \"立刻创建\" (Create Now)")
+    print_info("      next to \"一键自动创建机器人应用\"")
+    print_info("   3. Enter the robot name (机器人名称), description (机器人简介),")
+    print_info("      and upload an icon (机器人图标), then confirm")
+    print_info("   4. Copy the Client ID (AppKey) and Client Secret (AppSecret)")
+    print_info("      from Credentials & Basic Info (凭证与基础信息)")
+    print_info("")
+    print_info("   Full guide: https://hermes-agent.nousresearch.com/docs/user-guide/messaging/dingtalk")
     print()
-    print_info("  1. Go to https://open-dev.dingtalk.com and create a robot application.")
-    print_info("  2. Under 'Credentials & Basic Info', copy your AppKey (Client ID)")
-    print_info("     and AppSecret (Client Secret).")
-    print()
-
-    client_id = prompt("  AppKey (Client ID)")
+    client_id = prompt("Client ID (AppKey)")
     if not client_id:
         return
     save_env_value("DINGTALK_CLIENT_ID", client_id)
-
-    client_secret = prompt("  AppSecret (Client Secret)", password=True)
+    client_secret = prompt("Client Secret (AppSecret)", password=True)
     if not client_secret:
         return
     save_env_value("DINGTALK_CLIENT_SECRET", client_secret)
-    print_success("  DingTalk credentials saved.")
+    print_success("DingTalk credentials saved")
 
-    # Step 2: Access control
-    # DINGTALK_ALLOW_ALL_USERS=true delegates access control to DingTalk's
-    # App Availability Scope (应用可见范围) rather than an in-bot allowlist.
-    # Users can restrict access via the DingTalk Developer Console instead.
+    print()
+    print_info("Step 2: Configure who can access the robot (配置访问范围)")
+    print_info("")
+    print_info("   Access is controlled via DingTalk's admin console — not Hermes.")
+    print_info("   In your app's details page:")
+    print_info("   Version Management & Release (版本管理与发布) → Create Version")
+    print_info("   (新建版本) → set App Availability Scope (应用可用范围)")
+    print_info("   to the users or departments you want to allow.")
+    print_info("")
+    print_info("   By default only the app creator can access the robot.")
     save_env_value("DINGTALK_ALLOW_ALL_USERS", "true")
-    print()
-    print_info("  Access control is delegated to DingTalk's App Availability Scope.")
-    print_info("  To restrict who can use the bot, publish a version in the DingTalk")
-    print_info("  Developer Console and set the appropriate scope.")
 
-    # Step 3: AI Card streaming (optional)
     print()
-    if prompt_yes_no("  Configure AI Card streaming for live tool-call progress? (optional)", False):
-        print()
-        print_info("  Create a card template at https://open-dev.dingtalk.com/fe/card")
-        print_info("  and copy the Template ID below.")
-        print()
-        template_id = prompt("  Card Template ID")
+    print_info("Step 3: AI Card streaming (AI 卡片，Optional)")
+    print_info("")
+    print_info("   AI Card lets the bot display tool call progress in real time")
+    print_info("   using a rich card UI. Requires creating a card template first:")
+    print_info("   https://open-dev.dingtalk.com/fe/card")
+    print_info("   → Create AI Card (新建 AI 卡片), or reuse an existing one")
+    print_info("   Reference: https://open.dingtalk.com/document/development/ai-card-template")
+    print()
+    if prompt_yes_no("Configure AI Card streaming?", False):
+        print_info("")
+        print_info("   Card Template ID (模板 ID) — found on the card template detail page:")
+        template_id = prompt("Card Template ID")
         if template_id:
-            template_key = prompt("  Content variable name in template", default="content") or "content"
+            print_info("")
+            print_info("   Card content field key (流式输出内容字段名) — the variable name")
+            print_info("   defined in the card template for the streaming text output:")
+            template_key = prompt("Card content field key", default="content") or "content"
             cfg = load_config()
             cfg.setdefault("platforms", {}).setdefault("dingtalk", {}).setdefault("extra", {})
             cfg["platforms"]["dingtalk"]["extra"]["card_template_id"] = template_id
             cfg["platforms"]["dingtalk"]["extra"]["card_template_key"] = template_key
             save_config(cfg)
-            print_success("  AI Card configuration saved.")
+            print_success("AI Card config written to ~/.hermes/config.yaml")
+            print_info("")
+            print_info("   Config written:")
+            print_info("   platforms:")
+            print_info("     dingtalk:")
+            print_info("       extra:")
+            print_info(f"         card_template_id: \"{template_id}\"")
+            print_info(f"         card_template_key: \"{template_key}\"")
 
 
 def _setup_feishu():
