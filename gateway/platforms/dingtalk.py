@@ -50,6 +50,7 @@ except ImportError:
     mutagen = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.session import build_session_key
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -395,6 +396,18 @@ class DingTalkAdapter(BasePlatformAdapter):
         if self._ack_reaction_enabled and chat_id:
             await self._add_reaction(msg_id, chat_id)
             logger.info("[%s] reaction added (persistent ACK): msg_id=%s", self.name, msg_id)
+
+        _sk = build_session_key(
+            source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+        if _sk in self._active_sessions:
+            logger.info("[%s] message will interrupt active session: msg_id=%s from=%s text=%r",
+                        self.name, msg_id, sender_nick, (text or "")[:80])
+        else:
+            logger.info("[%s] message content: msg_id=%s from=%s text=%r",
+                        self.name, msg_id, sender_nick, (text or "")[:80])
 
         await self.handle_message(event)
 
