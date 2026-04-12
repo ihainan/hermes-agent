@@ -1038,7 +1038,7 @@ class DingTalkAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_image: failed to download %s: %s", self.name, image_url[:80], e)
             return await self.send(chat_id, f"[Image]({image_url})" + (f"\n{caption}" if caption else ""), reply_to=reply_to, metadata=metadata)
 
-        media_id = await self._upload_media(image_bytes, "image", filename)
+        media_id, _upload_err = await self._upload_media(image_bytes, "image", filename)
         if not media_id:
             return await self.send(chat_id, f"[Image]({image_url})" + (f"\n{caption}" if caption else ""), reply_to=reply_to, metadata=metadata)
 
@@ -1067,11 +1067,12 @@ class DingTalkAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"Cannot read image file: {e}")
 
         filename = os.path.basename(image_path) or "image.jpg"
-        media_id = await self._upload_media(image_bytes, "image", filename)
+        media_id, upload_error = await self._upload_media(image_bytes, "image", filename)
         if not media_id:
+            reason = f"（{upload_error}）" if upload_error else ""
             return await self.send(
                 chat_id,
-                f"🖼️ {caption or filename}",
+                f"🖼️ {caption or filename}{reason}",
                 reply_to=reply_to,
                 metadata=metadata,
             )
@@ -1105,20 +1106,27 @@ class DingTalkAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"Cannot read audio file: {e}")
 
         filename = os.path.basename(audio_path) or "audio.amr"
-        media_id = await self._upload_media(audio_bytes, "voice", filename)
+        media_id, upload_error = await self._upload_media(audio_bytes, "voice", filename)
         if not media_id:
-            text = f"🔊 **{filename}**\n（语音文件发送失败）" + (f"\n{caption}" if caption else "")
+            reason = f"（{upload_error}）" if upload_error else "（上传失败）"
+            text = f"🔊 **{filename}** {reason}" + (f"\n{caption}" if caption else "")
             return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
 
         duration_ms = self._get_audio_duration_ms(audio_path)
-        result = await self._send_media_via_webhook(
+        webhook_result = await self._send_media_via_webhook(
             chat_id, "voice",
             {"media_id": media_id, "duration": str(duration_ms)},
             metadata,
-        ) or await self._send_media_proactive(
+        )
+        if webhook_result is not None and webhook_result.success:
+            return webhook_result
+        result = await self._send_media_proactive(
             chat_id, "sampleAudio",
             {"mediaId": media_id, "duration": str(duration_ms)},
         )
+        if not result.success:
+            text = f"🔊 **{filename}**\n（语音发送失败）" + (f"\n{caption}" if caption else "")
+            return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
         return result
 
     async def send_document(
@@ -1142,20 +1150,28 @@ class DingTalkAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"Cannot read file: {e}")
 
         filename = file_name or os.path.basename(file_path) or "document"
-        media_id = await self._upload_media(file_bytes, "file", filename)
+        media_id, upload_error = await self._upload_media(file_bytes, "file", filename)
         if not media_id:
-            text = f"📎 **{filename}**\n（文件发送失败）" + (f"\n{caption}" if caption else "")
+            reason = f"（{upload_error}）" if upload_error else "（上传失败）"
+            text = f"📎 **{filename}** {reason}" + (f"\n{caption}" if caption else "")
             return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
 
         file_type = os.path.splitext(filename)[1].lstrip(".") or "bin"
-        result = await self._send_media_via_webhook(
+        # Session webhook file format uses camelCase fields (confirmed from DingTalk API errors).
+        webhook_result = await self._send_media_via_webhook(
             chat_id, "file",
-            {"media_id": media_id},
+            {"mediaId": media_id, "fileName": filename, "fileType": file_type},
             metadata,
-        ) or await self._send_media_proactive(
+        )
+        if webhook_result is not None and webhook_result.success:
+            return webhook_result
+        result = await self._send_media_proactive(
             chat_id, "sampleFile",
             {"mediaId": media_id, "fileName": filename, "fileType": file_type},
         )
+        if not result.success:
+            text = f"📎 **{filename}**\n（文件发送失败）" + (f"\n{caption}" if caption else "")
+            return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
         return result
 
     async def send_video(
@@ -1179,21 +1195,32 @@ class DingTalkAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"Cannot read video file: {e}")
 
         filename = os.path.basename(video_path) or "video.mp4"
-        media_id = await self._upload_media(video_bytes, "video", filename)
+        media_id, upload_error = await self._upload_media(video_bytes, "video", filename)
         if not media_id:
-            text = f"🎬 **{filename}**\n（视频发送失败）" + (f"\n{caption}" if caption else "")
+            reason = f"（{upload_error}）" if upload_error else "（上传失败）"
+            text = f"🎬 **{filename}** {reason}" + (f"\n{caption}" if caption else "")
             return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
 
         file_ext = os.path.splitext(filename)[1].lstrip(".").lower() or "mp4"
-        result = await self._send_media_via_webhook(
+        # Session webhook video format uses "videoMediaId" (confirmed from DingTalk API error
+        # errcode=401202 "miss param : video->videoMediaId").
+        webhook_result = await self._send_media_via_webhook(
             chat_id, "video",
-            {"media_id": media_id},
+            {"videoMediaId": media_id},
             metadata,
-        ) or await self._send_media_proactive(
+        )
+        if webhook_result is not None and webhook_result.success:
+            if caption:
+                await self.send(chat_id, caption, reply_to=reply_to, metadata=metadata)
+            return webhook_result
+        result = await self._send_media_proactive(
             chat_id, "sampleFile",
             {"mediaId": media_id, "fileName": filename, "fileType": file_ext},
         )
-        if caption and result.success:
+        if not result.success:
+            text = f"🎬 **{filename}**\n（视频发送失败）" + (f"\n{caption}" if caption else "")
+            return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
+        if caption:
             await self.send(chat_id, caption, reply_to=reply_to, metadata=metadata)
         return result
 
@@ -1202,14 +1229,16 @@ class DingTalkAdapter(BasePlatformAdapter):
         data: bytes,
         media_type: str,
         filename: str,
-    ) -> "Optional[str]":
-        """Upload media bytes to DingTalk and return the mediaId.
+    ) -> "Tuple[Optional[str], Optional[str]]":
+        """Upload media bytes to DingTalk and return (mediaId, error_reason).
 
         media_type must be one of: image, voice, video, file.
-        Returns None on failure (caller should fall back to text).
+        On success returns (media_id, None).
+        On failure returns (None, human-readable reason) so callers can surface
+        a useful message to the user instead of a generic failure notice.
         """
         if not self._http_client:
-            return None
+            return None, "HTTP 客户端未初始化"
         try:
             body, boundary = self._build_multipart(data, filename)
             # oapi.dingtalk.com takes access_token and media type as query params.
@@ -1229,19 +1258,21 @@ class DingTalkAdapter(BasePlatformAdapter):
             if resp.status_code >= 300:
                 logger.warning("[%s] Media upload failed HTTP %d: %s",
                                self.name, resp.status_code, resp.text[:200])
-                return None
+                return None, f"上传失败 HTTP {resp.status_code}"
             result = resp.json()
             # oapi.dingtalk.com returns errcode=0 and media_id (snake_case).
             if result.get("errcode", -1) != 0:
+                errmsg = result.get("errmsg", "未知错误")
                 logger.warning("[%s] Media upload error response: %s", self.name, str(result)[:200])
-                return None
+                return None, errmsg
             media_id = result.get("media_id")
             if not media_id:
                 logger.warning("[%s] No media_id in upload response: %s", self.name, str(result)[:200])
-            return media_id
+                return None, "上传响应中无 media_id"
+            return media_id, None
         except Exception as e:
             logger.warning("[%s] Media upload error: %s", self.name, e)
-            return None
+            return None, str(e)
 
     def _build_multipart(self, data: bytes, filename: str) -> tuple:
         """Build a multipart/form-data body for the DingTalk oapi media upload.

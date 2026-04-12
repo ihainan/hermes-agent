@@ -1311,8 +1311,9 @@ class TestUploadMedia:
         adapter = self._make_adapter()
         adapter._http_client.post = AsyncMock(return_value=self._ok_upload_resp("m-123"))
 
-        result = await adapter._upload_media(b"bytes", "image", "img.jpg")
-        assert result == "m-123"
+        media_id, error = await adapter._upload_media(b"bytes", "image", "img.jpg")
+        assert media_id == "m-123"
+        assert error is None
         mod._TOKEN_CACHE.pop("bot-id", None)
 
     @pytest.mark.asyncio
@@ -1354,8 +1355,9 @@ class TestUploadMedia:
         adapter = self._make_adapter()
         adapter._http_client.post = AsyncMock(return_value=self._err_resp(500))
 
-        result = await adapter._upload_media(b"bytes", "image", "img.jpg")
-        assert result is None
+        media_id, error = await adapter._upload_media(b"bytes", "image", "img.jpg")
+        assert media_id is None
+        assert error is not None
         mod._TOKEN_CACHE.pop("bot-id", None)
 
     @pytest.mark.asyncio
@@ -1371,8 +1373,9 @@ class TestUploadMedia:
         resp.text = ""
         adapter._http_client.post = AsyncMock(return_value=resp)
 
-        result = await adapter._upload_media(b"bytes", "image", "img.jpg")
-        assert result is None
+        media_id, error = await adapter._upload_media(b"bytes", "image", "img.jpg")
+        assert media_id is None
+        assert error is not None
         mod._TOKEN_CACHE.pop("bot-id", None)
 
     @pytest.mark.asyncio
@@ -1380,8 +1383,9 @@ class TestUploadMedia:
         from gateway.platforms.dingtalk import DingTalkAdapter
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
         adapter._http_client = None
-        result = await adapter._upload_media(b"bytes", "image", "img.jpg")
-        assert result is None
+        media_id, error = await adapter._upload_media(b"bytes", "image", "img.jpg")
+        assert media_id is None
+        assert error is not None
 
     @pytest.mark.asyncio
     async def test_returns_none_on_token_error(self):
@@ -1395,8 +1399,9 @@ class TestUploadMedia:
         bad_resp.text = "Forbidden"
         adapter._http_client.post = AsyncMock(return_value=bad_resp)
 
-        result = await adapter._upload_media(b"bytes", "image", "img.jpg")
-        assert result is None
+        media_id, error = await adapter._upload_media(b"bytes", "image", "img.jpg")
+        assert media_id is None
+        assert error is not None
 
 
 class TestSendMediaProactive:
