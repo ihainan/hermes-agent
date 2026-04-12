@@ -1113,7 +1113,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         duration_ms = self._get_audio_duration_ms(audio_path)
         result = await self._send_media_via_webhook(
             chat_id, "voice",
-            {"mediaId": media_id, "duration": str(duration_ms)},
+            {"media_id": media_id, "duration": str(duration_ms)},
             metadata,
         ) or await self._send_media_proactive(
             chat_id, "sampleAudio",
@@ -1150,7 +1150,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         file_type = os.path.splitext(filename)[1].lstrip(".") or "bin"
         result = await self._send_media_via_webhook(
             chat_id, "file",
-            {"mediaId": media_id, "fileName": filename, "fileType": file_type},
+            {"media_id": media_id},
             metadata,
         ) or await self._send_media_proactive(
             chat_id, "sampleFile",
@@ -1187,7 +1187,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         file_ext = os.path.splitext(filename)[1].lstrip(".").lower() or "mp4"
         result = await self._send_media_via_webhook(
             chat_id, "video",
-            {"mediaId": media_id, "fileName": filename, "fileType": file_ext},
+            {"media_id": media_id},
             metadata,
         ) or await self._send_media_proactive(
             chat_id, "sampleFile",
