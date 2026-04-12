@@ -814,6 +814,7 @@ class TestExtractQuotedContext:
         assert msg_id is None
 
     def test_extracts_quoted_text_and_id(self):
+        """Legacy fixture format using msgContent (kept for backward compat)."""
         from gateway.platforms.dingtalk import DingTalkAdapter
         msg = self._make_msg({
             "content": "my reply",
@@ -827,6 +828,38 @@ class TestExtractQuotedContext:
         text, msg_id = DingTalkAdapter._extract_quoted_context(msg)
         assert text == "original content"
         assert msg_id == "orig-msg-123"
+
+    def test_extracts_quoted_text_real_payload_format(self):
+        """Real DingTalk payloads put the text in repliedMsg.content.text."""
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        msg = self._make_msg({
+            "content": "my reply",
+            "isReplyMsg": True,
+            "repliedMsg": {
+                "msgId": "orig-msg-456",
+                "msgType": "text",
+                "senderId": "$:LWCP_v1:$abc123",
+                "content": {"text": "real quoted text"},
+            },
+        })
+        text, msg_id = DingTalkAdapter._extract_quoted_context(msg)
+        assert text == "real quoted text"
+        assert msg_id == "orig-msg-456"
+
+    def test_content_text_takes_priority_over_msgcontent(self):
+        """content.text is preferred; msgContent is only a fallback."""
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        msg = self._make_msg({
+            "content": "my reply",
+            "isReplyMsg": True,
+            "repliedMsg": {
+                "msgId": "id-prio",
+                "msgContent": "legacy value",
+                "content": {"text": "preferred value"},
+            },
+        })
+        text, msg_id = DingTalkAdapter._extract_quoted_context(msg)
+        assert text == "preferred value"
 
     def test_graceful_when_replied_msg_absent(self):
         from gateway.platforms.dingtalk import DingTalkAdapter
@@ -846,7 +879,7 @@ class TestExtractQuotedContext:
         assert text is None
         assert msg_id is None
 
-    def test_returns_none_when_msg_content_empty(self):
+    def test_returns_none_when_msg_content_empty_no_type(self):
         from gateway.platforms.dingtalk import DingTalkAdapter
         msg = self._make_msg({
             "content": "reply",
@@ -855,6 +888,51 @@ class TestExtractQuotedContext:
         })
         text, msg_id = DingTalkAdapter._extract_quoted_context(msg)
         assert text is None
+
+    @pytest.mark.parametrize("msg_type,expected_placeholder", [
+        ("picture", "<media:image>"),
+        ("audio",   "<media:voice>"),
+        ("video",   "<media:video>"),
+        ("file",    "<media:file>"),
+    ])
+    def test_media_type_returns_placeholder(self, msg_type, expected_placeholder):
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        msg = self._make_msg({
+            "content": "my reply",
+            "isReplyMsg": True,
+            "repliedMsg": {
+                "msgId": "media-msg-1",
+                "msgType": msg_type,
+                "msgContent": "",
+                "msgSenderNick": "Alice",
+            },
+        })
+        text, msg_id = DingTalkAdapter._extract_quoted_context(msg)
+        assert text == expected_placeholder
+        assert msg_id == "media-msg-1"
+
+    def test_unknown_media_type_still_returns_none(self):
+        """An unrecognised msgType with empty msgContent should not inject garbage."""
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        msg = self._make_msg({
+            "content": "reply",
+            "isReplyMsg": True,
+            "repliedMsg": {"msgId": "id-x", "msgType": "unknownFutureMsgType", "msgContent": ""},
+        })
+        text, msg_id = DingTalkAdapter._extract_quoted_context(msg)
+        assert text is None
+
+    def test_text_type_with_content_unaffected(self):
+        """If msgType is 'text' and msgContent is populated, returns the text as-is."""
+        from gateway.platforms.dingtalk import DingTalkAdapter
+        msg = self._make_msg({
+            "content": "reply",
+            "isReplyMsg": True,
+            "repliedMsg": {"msgId": "id-2", "msgType": "text", "msgContent": "hello world"},
+        })
+        text, msg_id = DingTalkAdapter._extract_quoted_context(msg)
+        assert text == "hello world"
+        assert msg_id == "id-2"
 
 
 class TestQuotedContextInjection:

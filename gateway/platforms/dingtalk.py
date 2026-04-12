@@ -85,6 +85,16 @@ _TOKEN_REFRESH_BUFFER = 60      # seconds before expiry to proactively refresh
 _TOKEN_RETRY_ATTEMPTS = 3
 _TOKEN_RETRY_BASE_DELAY = 0.1   # seconds (100 ms), doubles each retry
 
+# Placeholder text injected into the quoted-context prefix when the replied
+# message is a media attachment (picture/audio/video/file).  The agent sees
+# e.g. '[Replying to Alice: "<media:image>"]' instead of a silent empty string.
+QUOTED_MEDIA_PLACEHOLDERS: Dict[str, str] = {
+    "picture": "<media:image>",
+    "audio":   "<media:voice>",
+    "video":   "<media:video>",
+    "file":    "<media:file>",
+}
+
 # Module-level cache: clientId → (access_token, expires_at_unix_float)
 # Shared across adapter instances within the same process (survives reconnects).
 _TOKEN_CACHE: Dict[str, tuple] = {}
@@ -339,7 +349,11 @@ class DingTalkAdapter(BasePlatformAdapter):
             else:
                 raw_dict = {}
             replied = raw_dict.get("repliedMsg") or {}
-            quoted_sender = replied.get("msgSenderNick", "") if isinstance(replied, dict) else ""
+            # Real DingTalk payloads expose senderId (not msgSenderNick).
+            # Use msgSenderNick as fallback for test fixtures that set it.
+            quoted_sender = (
+                replied.get("msgSenderNick") or replied.get("senderId") or ""
+            ) if isinstance(replied, dict) else ""
             prefix = f'[Replying to {quoted_sender}: "{reply_to_text}"]\n' if quoted_sender else f'[Replying to: "{reply_to_text}"]\n'
             text = prefix + text
 
@@ -649,6 +663,11 @@ class DingTalkAdapter(BasePlatformAdapter):
         Returns (reply_to_text, reply_to_message_id). Both are None if the
         message is not a reply or if quoted fields are absent/malformed.
 
+        For media-type replied messages (picture/audio/video/file), msgContent
+        is empty. In that case a human-readable placeholder from
+        QUOTED_MEDIA_PLACEHOLDERS is returned so the agent is not silently
+        missing the quoted context.
+
         The SDK parses msgtype=text into a TextContent object; extra fields
         such as isReplyMsg and repliedMsg land in TextContent.extensions.
         We also handle the legacy dict format for test compatibility.
@@ -672,8 +691,25 @@ class DingTalkAdapter(BasePlatformAdapter):
         if not replied or not isinstance(replied, dict):
             return None, None
 
-        msg_content = replied.get("msgContent") or ""
+        # DingTalk puts the text in repliedMsg.content.text (confirmed from real
+        # device payloads).  Fall back to the legacy msgContent key so that
+        # existing unit-test fixtures still pass.
+        _replied_content = replied.get("content") or {}
+        msg_content = (
+            (_replied_content.get("text") if isinstance(_replied_content, dict) else None)
+            or replied.get("msgContent")
+            or ""
+        )
         msg_id = replied.get("msgId") or None
+
+        # For media-type replied messages the text is empty; substitute a
+        # placeholder so the agent knows what kind of media was being quoted.
+        if not msg_content.strip():
+            msg_type = replied.get("msgType") or ""
+            placeholder = QUOTED_MEDIA_PLACEHOLDERS.get(msg_type)
+            if placeholder:
+                return placeholder, msg_id
+
         return (msg_content.strip() or None), msg_id
 
     # -- OAuth token management ---------------------------------------------
