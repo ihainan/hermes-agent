@@ -817,7 +817,7 @@ class DingTalkAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error="HTTP client not initialized")
             payload = {
                 "msgtype": "markdown",
-                "markdown": {"title": "Hermes", "text": content[:self.MAX_MESSAGE_LENGTH]},
+                "markdown": {"title": self._extract_message_title(content), "text": content[:self.MAX_MESSAGE_LENGTH]},
             }
             logger.debug("[%s] Sending via session_webhook: %s", self.name, session_webhook[:80])
             # Fetch auth headers before the network call so token errors don't
@@ -855,6 +855,18 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         return result
 
+    @staticmethod
+    def _extract_message_title(text: str, default_title: str = "Hermes") -> str:
+        """Derive a notification/preview title from the first line of the message.
+
+        Strips leading Markdown markers (headings, bullets, bold, etc.) and
+        truncates to 20 characters — matching the behaviour of the openclaw
+        DingTalk reference implementation (message-utils.ts detectMarkdownAndExtractTitle).
+        """
+        first_line = text.split("\n")[0]
+        stripped = re.sub(r"^[#*\s\->]+", "", first_line).strip()
+        return stripped[:20] or default_title
+
     async def _send_proactive(self, chat_id: str, content: str) -> SendResult:
         """Send via DingTalk proactive robot API (no session_webhook needed).
 
@@ -883,7 +895,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         last_result: SendResult = SendResult(success=False, error="No content")
 
         for chunk in chunks:
-            msg_param = json.dumps({"title": "Hermes", "text": chunk})
+            msg_param = json.dumps({"title": self._extract_message_title(content), "text": chunk})
             payload: Dict[str, Any] = {
                 "robotCode": self._client_id,
                 "msgKey": "sampleMarkdown",

@@ -177,7 +177,7 @@ class TestSend:
         assert call_args[0][0] == "https://dingtalk.example/webhook"
         payload = call_args[1]["json"]
         assert payload["msgtype"] == "markdown"
-        assert payload["markdown"]["title"] == "Hermes"
+        assert payload["markdown"]["title"] == "Hello!"
         assert payload["markdown"]["text"] == "Hello!"
         mod._TOKEN_CACHE.pop("", None)
 
@@ -361,7 +361,7 @@ class TestProactiveMessaging:
         assert payload["msgKey"] == "sampleMarkdown"
         assert payload["openConversationId"] == "cidGROUP1"
         msg_param = json.loads(payload["msgParam"])
-        assert msg_param["title"] == "Hermes"
+        assert msg_param["title"] == "test content"
         assert msg_param["text"] == "test content"
         mod._TOKEN_CACHE.pop("bot-id", None)
 
