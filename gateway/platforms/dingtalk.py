@@ -136,9 +136,9 @@ class DingTalkAdapter(BasePlatformAdapter):
         # Disable with config.extra.ack_reaction = "none"
         ack_cfg = (extra.get("ack_reaction") or "emoji").strip().lower()
         self._ack_reaction_enabled: bool = ack_cfg != "none"
-        # DingTalk native "thinking" reaction — only one type is supported.
+        # DingTalk native ACK reaction — only one type is supported.
         # Attached on message receipt, recalled when the response is sent.
-        _THINKING_REACTION = "🤔思考中"
+        _THINKING_REACTION = "收到"
         self._THINKING_EMOTION_PAYLOAD = {
             "emotionType": 2,
             "emotionName": _THINKING_REACTION,
