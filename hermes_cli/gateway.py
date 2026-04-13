@@ -2152,18 +2152,26 @@ def _setup_dingtalk():
     if not client_secret:
         return
     save_env_value("DINGTALK_CLIENT_SECRET", client_secret)
+
+    cfg = load_config()
+    cfg.setdefault("platforms", {}).setdefault("dingtalk", {})["enabled"] = True
+    save_config(cfg)
     print_success("DingTalk credentials saved")
 
     print()
     print_info("Step 2: Configure who can access the robot (配置访问范围)")
     print_info("")
-    print_info("   Access is controlled via DingTalk's admin console — not Hermes.")
-    print_info("   In your app's details page:")
-    print_info("   Version Management & Release (版本管理与发布) → Create Version")
-    print_info("   (新建版本) → set App Availability Scope (应用可用范围)")
-    print_info("   to the users or departments you want to allow.")
+    print_info("   Hermes delegates access control to DingTalk's platform-level App")
+    print_info("   Availability Scope rather than maintaining its own allowlist.")
+    print_info("   By default only the app creator can interact with the robot.")
+    print_info("   To grant access to other users or departments:")
+    print_info("     版本管理与发布 (Version Management & Release) → 新建版本 (Create Version)")
+    print_info("     → set 应用可见范围 (App Availability Scope) → 发布 (Publish)")
     print_info("")
-    print_info("   By default only the app creator can access the robot.")
+    print_info("   To set a home channel for cron delivery, send the bot a message first")
+    print_info("   then use /sethome — DingTalk chat IDs are only known after the first message.")
+    print_info("")
+    print_info("   Full guide: https://hermes-agent.nousresearch.com/docs/user-guide/messaging/dingtalk")
     save_env_value("DINGTALK_ALLOW_ALL_USERS", "true")
 
     print()
@@ -2197,6 +2205,9 @@ def _setup_dingtalk():
             print_info("       extra:")
             print_info(f"         card_template_id: \"{template_id}\"")
             print_info(f"         card_template_key: \"{template_key}\"")
+
+    print()
+    print_success("DingTalk configured!")
 
 
 def _setup_wecom():
@@ -2732,6 +2743,8 @@ def gateway_setup():
             _setup_signal()
         elif platform["key"] == "weixin":
             _setup_weixin()
+        elif platform["key"] == "dingtalk":
+            _setup_dingtalk()
         elif platform["key"] == "feishu":
             _setup_feishu()
         else:
