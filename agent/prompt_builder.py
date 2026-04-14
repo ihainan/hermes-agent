@@ -389,6 +389,12 @@ PLATFORM_HINTS = {
         "You can also include image URLs in markdown format ![alt](url) and "
         "they will be sent as photos."
     ),
+    "qqbot": (
+        "You are on QQ, a popular Chinese messaging platform. QQ supports markdown formatting "
+        "and emoji. You can send media files natively: include MEDIA:/absolute/path/to/file in "
+        "your response. Images are sent as native photos, and other files arrive as downloadable "
+        "documents."
+    ),
 }
 
 # ---------------------------------------------------------------------------
